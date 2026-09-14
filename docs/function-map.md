@@ -10,14 +10,23 @@ This page tracks the current working identifications for high-interest Prism3D f
 | `0x1402E25A0` | semantic/resource resolver | High | Resolves a semantic/resource ID to an `r_resource_packet_entry_t`; repeated lookup inside one bundle may be avoidable work. |
 | `0x14144C770` | uniform/resource context setup + provider-cache check | Medium/High | Small, very hot function. Uses a compact cache key and conditionally rebuilds provider/cache state. High sample count does not imply high per-call cost. |
 | `0x1402942D0` | descriptor update/build stage | High | Recovered `shader_pipeline_build_descriptor_update_info` path; builds the per-draw descriptor/root-table state consumed downstream. |
-| `0x14029E1F0` | draw/state/root-table submission stage | High | State/root-table/draw path reached after descriptor work. |
+| `0x14029E1F0` | draw/state/root-table submission stage | High | Generalized state/root-table/draw path reached after descriptor work. |
 | `0x14022E380` | material lookup helper | High | Small `r_material_t` array helper; not considered a primary bottleneck. |
 | `0x1401DB850` | `pp_batch_data_t` index/helper | High | Small array helper; not considered a primary bottleneck. |
 | `0x14144CE50` | `uniform_builder_t` array lookup helper | High | 97-byte bounds-checked lookup called from the 1.60 bundle loop; equivalent work is inline in the mapped 1.58 function. |
+| `0x14144C160` | composite `uniform_builder_t` merge helper | Medium/High | Combines differing builders while merging/deduplicating callback entries as 1.60 cross-stage resource layouts are assembled. |
+| `0x1402E4D50` | shader-pipeline cache/create path with profile state | Medium/High | Cache/create path uses six shader identities and stores the selected shader-profile ID in the created pipeline; exact cache-key/profile invariant is still under investigation. |
+| `0x140292620` | pipeline-state lookup/task path | Medium/High | Larger 1.60 path that can enqueue `compile_pipeline_task_t`; runtime significance is not yet established. |
 
 ### Current chain
 
 ```text
+RFX pass / shader profile
+  ↓
+resource bucketization + cross-stage merge
+  ↓
+0x14144C160  composite uniform-builder merge when needed
+  ↓
 r_item
   ↓
 0x14144C770
@@ -32,12 +41,12 @@ DX12 descriptor update/build
   ↓
 0x14029E1F0
   ↓
-state / root tables / draw submission
+generalized state / root tables / draw submission
 ```
 
 ## 1.58.1.4s
 
-Corpus-driven static matching now identifies the pre-regression counterparts with high confidence:
+Corpus-driven static matching identifies the pre-regression counterparts with high confidence:
 
 | 1.58 address | Counterpart in 1.60 | Evidence summary | Confidence |
 |---|---|---|---|
@@ -51,13 +60,18 @@ Corpus-driven static matching now identifies the pre-regression counterparts wit
 
 ### Important static-diff note
 
-The semantic/resource resolver and the small context/cache helper are algorithmically almost unchanged between 1.58 and 1.60. The strongest structural delta is downstream in descriptor/root-table handling:
+The semantic/resource resolver and the small context/cache helper are algorithmically almost unchanged between 1.58 and 1.60. The strongest structural delta is now understood as a broader 1.60 shader-profile/resource-layout architecture:
 
-- the mapped descriptor/update payload grows substantially in 1.60
+- RFX passes gain shader-profile selection/validation
+- resources can be split across three binding buckets and merged across shader stages
+- `uniform_builder_t` grows from `0x30` to `0x40` and 1.60 gains composite-builder merge machinery
+- the mapped descriptor/update payload grows substantially
 - the per-entry state stride visible in the descriptor builder grows from `0x1E0` to `0x2C0`
-- the temporary descriptor/update block allocated by the same arena allocator grows from `0x18` bytes in 1.58 to `0x98` bytes in 1.60
-- 1.60 zero-initializes 16 additional 64-bit table/state slots in that block
+- the temporary descriptor/update block grows from `0x18` bytes in 1.58 to `0x98` bytes in 1.60
+- 1.60 zero-initializes 16 additional 64-bit table/state slots
 - the mapped draw submission function grows from 1388 to 1984 bytes and moves from a compact fixed table path to generalized root-signature set/table traversal with cached root-table state
+
+See `docs/shader-profile-architecture-delta.md` for the current architecture-level interpretation.
 
 These are static facts. Their runtime cost still requires direct measurement before any patch is justified.
 
