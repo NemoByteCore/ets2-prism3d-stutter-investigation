@@ -109,6 +109,12 @@ Additional small helpers:
 ## Current render/resource chain
 
 ```text
+RFX pass / shader profile
+  ↓
+resource bucketization + cross-stage merge
+  ↓
+composite uniform-builder merge when needed
+  ↓
 r_item
   ↓
 1.60:FUN_14144C770
@@ -123,7 +129,7 @@ DX12 descriptor update/build
   ↓
 1.60:FUN_14029E1F0
   ↓
-state / root tables / draw submission
+generalized root-table/state submission
 ```
 
 ### `1.60:FUN_1402D7D70`
@@ -190,6 +196,65 @@ The mapped pipeline-state lookup path grows from a 180-byte synchronous routing 
 
 Again, this requires hit/miss/task-rate measurement before it can be treated as a contributor to sustained slowdown.
 
+## Deep static architecture delta
+
+A deeper pass shows that the descriptor/root-table expansion is part of a wider 1.60 redesign rather than an isolated backend change.
+
+### FACT — RFX passes gain shader-profile selection
+
+The 1.60 RFX/pass path contains shader-profile parsing and validation absent from the mapped 1.58 flow.
+
+The parser recognizes 13 shader-profile names. The selected profile is carried into the shader-pipeline representation and later chooses one of 13 prebuilt DX12 root-signature profiles.
+
+The full profile table still needs targeted static-data extraction.
+
+### FACT — resources gain three-way bucketization
+
+1.60 resource metadata carries an additional selector that can assign a resource to one of three binding buckets/sets.
+
+Pipeline construction merges those bucketed bindings across shader stages and combines visibility.
+
+### FACT — `uniform_builder_t` expands and gains composite merge support
+
+The corresponding builder stride changes:
+
+```text
+1.58: 0x30 = 48 bytes
+1.60: 0x40 = 64 bytes
+```
+
+A 1.60 helper at `0x14144C160` can combine differing builders while merging/deduplicating callback entries.
+
+This does not yet prove that more uniform callbacks execute per draw.
+
+### FACT — generalized profile-driven root-table handling
+
+The new architecture currently reads as:
+
+```text
+RFX shader profile
+→ 3-way resource buckets
+→ cross-stage layout merge
+→ composite uniform builders when needed
+→ pipeline profile ID
+→ one of 13 DX12 root-signature profiles
+→ generalized set/table mapping
+→ cached root-table handles
+→ conditional binds
+```
+
+See `docs/shader-profile-architecture-delta.md` for the dedicated summary.
+
+## Open static question: pipeline cache vs shader profile
+
+A high-interest 1.60 pipeline cache/create path is `0x1402E4D50`.
+
+Current static reading shows the lookup key built from six shader identities, while the selected shader-profile ID is stored in the created pipeline object.
+
+It is not yet established whether profile ID also participates indirectly in the cache identity or whether the engine enforces an invariant that one six-shader combination can only ever use one profile.
+
+**This is an open question, not a confirmed cache bug.**
+
 ## Uniform callback machinery
 
 Static 1.60 corpus currently shows roughly:
@@ -217,31 +282,38 @@ This suggests cost may be distributed across many callbacks rather than concentr
 
 ```text
 heavy scene
-→ high per-draw / per-resource-bundle work
-→ descriptor/update state construction has expanded since 1.58
-→ generalized root-table/state submission
+→ many draws/material passes
+→ 1.60 shader-profile/resource-layout architecture
+→ bucket merge + expanded descriptor/update state
+→ generalized profiled root-table submission
 → CPU reaches Present too late
 ```
 
+This is a working regression model, not yet proof of the exact cost mechanism.
+
 Highest-interest areas now:
 
-- `1.60:FUN_1402942D0` — descriptor/update construction and expanded per-draw state
-- `1.60:FUN_14029E1F0` — generalized root-table/state submission
-- `1.60:FUN_1402D7D70` — resource bundle construction, including the new out-of-line uniform-builder lookup
-- `1.60:FUN_140292620` — pipeline-state lookup/task path as a secondary measurement target
+- complete definition of the 13 shader/root-signature profiles
+- shader-combination ↔ profile cache invariant around `0x1402E4D50`
+- profile-dependent descriptor/update complexity
+- `0x1402942D0` and `0x14029E1F0` as later profile-aware runtime measurement targets
+- `0x14144C160` / expanded `uniform_builder_t` representation as a secondary static branch
 
 The semantic resolver remains a plausible optimization target, but it is no longer the strongest static candidate for explaining the 1.58 → 1.60 regression.
 
-## Next runtime measurement
+## Next step
 
-The next low-overhead probe should compare stable light and heavy scenes and aggregate:
+Do **not** start with the previously planned generic runtime probe yet.
 
-- `0x1402942D0`: calls/s, total wall-time/s, average/p95 duration, items processed, `0x98` temporary blocks allocated
-- `0x14029E1F0`: calls/s, total wall-time/s, root-signature changes, set/table entries examined, actual root-table binds, cached-equal skips
-- `0x14144CE50`: cheap aggregate call count/timing only
-- `0x140292620`: pipeline-state hit vs task-creation/miss counts if the first measurement shows meaningful activity there
+First perform targeted static-data/Ghidra extraction of the 13 shader-profile definitions:
 
-No behavior patch should be attempted before these rates are measured.
+- profile name → numeric ID
+- sets/root parameters per profile
+- descriptor-table classes/ranges per set
+- profile complexity differences
+- profile-assignment invariants relative to shader-pipeline caching
+
+After that, design a profile-aware runtime probe that can report descriptor/root-table cost and bind activity by profile rather than only global function timings.
 
 ## Version-comparison policy
 
