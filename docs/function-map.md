@@ -36,7 +36,9 @@ state / root tables / draw submission
 
 ## 1.58.1.4s
 
-Static analysis is being built now. Equivalent functions have **not yet been mapped**, so no 1.58 addresses are published here until they are identified with evidence.
+The dedicated Ghidra project has completed its initial Auto Analysis and is ready for targeted mapping. Equivalent functions have **not yet been identified with sufficient evidence**, so no 1.58 addresses are published here yet.
+
+The first mapping target is the 1.58 counterpart of `1.60.1.7s:0x1402D7D70`, followed by the semantic/resource resolver and the rest of the current 1.60 resource/descriptor chain.
 
 Reference executable SHA-256:
 
