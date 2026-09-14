@@ -103,8 +103,8 @@ If the key matches, heavier work is skipped.
 
 Additional small helpers:
 
-- `1.60:FUN_14022E380` — appears to be a trivial material lookup
-- `1.60:FUN_1401DB850` — appears to be a simple `pp_batch_data_t` indexer
+- `1.60:FUN_14022E380` — trivial `r_material_t` lookup
+- `1.60:FUN_1401DB850` — simple `pp_batch_data_t` array helper
 
 ## Current render/resource chain
 
@@ -138,31 +138,61 @@ r_device_t::resource_build_bundle(
 )
 ```
 
-This is currently a higher-priority investigation point than `14144C770` itself.
-
 ### `1.60:FUN_1402E25A0`
 
 Current identification: semantic/resource resolver.
 
 It receives a semantic/resource ID (`byte`) and resolves a matching `r_resource_packet_entry_t`. If there is no simple hit, it can iterate active resource packets for the draw and scan semantic IDs.
 
-Promising future PoC:
+A local per-bundle semantic memo remains a possible optimization experiment, but the 1.58 comparison now shows that this resolver algorithm already existed in essentially the same form before the reported regression.
 
-**memoize semantic → resource_packet_entry only within one `resource_build_bundle` call.**
+## 1.58 ↔ 1.60 static comparison
 
-Rationale:
+High-confidence counterpart mapping now gives:
 
-- no cache across frames
-- no cache across draws
-- low stale-state risk
-- first lookup remains Prism's normal behavior
-- repeated semantic IDs in the same bundle can avoid repeated scanning
+```text
+1.60.1.7s:0x1402D7D70  ↔  1.58.1.4s:0x1401EB530
+1.60.1.7s:0x1402E25A0  ↔  1.58.1.4s:0x1401F4FB0
+1.60.1.7s:0x14144C770  ↔  1.58.1.4s:0x14129BF20
+1.60.1.7s:0x1402942D0  ↔  1.58.1.4s:0x1401AC780
+1.60.1.7s:0x14029E1F0  ↔  1.58.1.4s:0x1401B4800
+```
 
-First step: measure the repeat rate before patching.
+See `docs/function-map.md` for the full mapping evidence.
+
+### FACT — resolver and context helper are conserved
+
+The semantic/resource resolver is the same 342-byte algorithm in both builds after accounting for relocated data/layout offsets. The small context/cache helper is likewise effectively identical at 421 bytes.
+
+**Interpretation:** neither function currently looks like a newly introduced 1.60 algorithmic regression by itself, even though both can still be hot enough to optimize.
+
+### FACT — one bundle-loop lookup moved out-of-line
+
+The 1.58 `resource_build_bundle` performs its `uniform_builder_t` array lookup inline. The mapped 1.60 function calls a separate 97-byte helper at `1.60.1.7s:0x14144CE50` inside the corresponding repeated loop.
+
+This adds a real function-call boundary in 1.60. Runtime call rate and exact timing are still required before assigning significance.
+
+### FACT — descriptor/root-table state expanded substantially
+
+The strongest static change appears downstream:
+
+- the corresponding per-entry state stride in the descriptor builder grows from `0x1E0` in 1.58 to `0x2C0` in 1.60
+- the same arena allocator is asked for `0x18` bytes in the 1.58 descriptor builder but `0x98` bytes in 1.60
+- the 1.60 block explicitly zeroes 16 additional 64-bit table/state slots
+- the mapped draw/state submission function grows from 1388 to 1984 bytes
+- 1.58 uses a compact fixed descriptor-table path, while 1.60 iterates root-signature set descriptors and tracks a larger cached root-table state
+
+These are static facts, not proof of runtime cost.
+
+### FACT — pipeline-state lookup architecture changed
+
+The mapped pipeline-state lookup path grows from a 180-byte synchronous routing function in 1.58 to a 394-byte 1.60 path that can enqueue `compile_pipeline_task_t` work and manage a bounded task queue.
+
+Again, this requires hit/miss/task-rate measurement before it can be treated as a contributor to sustained slowdown.
 
 ## Uniform callback machinery
 
-Static corpus currently shows roughly:
+Static 1.60 corpus currently shows roughly:
 
 - ~280 registrations
 - ~272 distinct names
@@ -187,25 +217,31 @@ This suggests cost may be distributed across many callbacks rather than concentr
 
 ```text
 heavy scene
-→ very high per-draw / per-resource-bundle work
-→ uniform evaluation + semantic/resource resolution
-→ descriptor construction
-→ draw/state submission
+→ high per-draw / per-resource-bundle work
+→ descriptor/update state construction has expanded since 1.58
+→ generalized root-table/state submission
 → CPU reaches Present too late
 ```
 
 Highest-interest areas now:
 
-- `1.60:FUN_1402D7D70` — resource bundle construction
-- `1.60:FUN_1402E25A0` — semantic/resource resolution
-- uniform callback machinery
-- descriptor builder downstream
+- `1.60:FUN_1402942D0` — descriptor/update construction and expanded per-draw state
+- `1.60:FUN_14029E1F0` — generalized root-table/state submission
+- `1.60:FUN_1402D7D70` — resource bundle construction, including the new out-of-line uniform-builder lookup
+- `1.60:FUN_140292620` — pipeline-state lookup/task path as a secondary measurement target
 
-Potential future fixes remain hypotheses:
+The semantic resolver remains a plausible optimization target, but it is no longer the strongest static candidate for explaining the 1.58 → 1.60 regression.
 
-- local per-bundle semantic-resolution memo
-- split/template the static part of a bundle per material/effect/pipeline
-- keep dynamic uniforms/view/object state fresh
+## Next runtime measurement
+
+The next low-overhead probe should compare stable light and heavy scenes and aggregate:
+
+- `0x1402942D0`: calls/s, total wall-time/s, average/p95 duration, items processed, `0x98` temporary blocks allocated
+- `0x14029E1F0`: calls/s, total wall-time/s, root-signature changes, set/table entries examined, actual root-table binds, cached-equal skips
+- `0x14144CE50`: cheap aggregate call count/timing only
+- `0x140292620`: pipeline-state hit vs task-creation/miss counts if the first measurement shows meaningful activity there
+
+No behavior patch should be attempted before these rates are measured.
 
 ## Version-comparison policy
 
