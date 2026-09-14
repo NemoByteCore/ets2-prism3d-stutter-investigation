@@ -4,11 +4,9 @@ Reverse-engineering investigation of scene-dependent CPU-side stutter in **Euro 
 
 ## Goal
 
-Find the CPU-side work that makes some scenes miss the ~16.67 ms frame budget, identify a safe workaround/patch if possible, and document the investigation well enough for the ETS2 modding / reverse-engineering community and SCS Software to reproduce or continue it.
+Find the CPU-side work that makes some scenes miss the ~16.67 ms frame budget, identify a safe workaround or patch if possible, and document the investigation well enough for the ETS2 modding / reverse-engineering community and SCS Software to reproduce or continue it.
 
-## Current state
-
-The strongest current model is:
+## Current model
 
 ```text
 heavy scene
@@ -26,26 +24,28 @@ Current high-interest functions in **1.60.1.7s**:
 - `0x14144C770` — small uniform/resource context + cache-key path
 - descriptor update/build and submission path downstream
 
-See [`docs/function-map.md`](docs/function-map.md) for the build-specific function map and [`pseudocode/`](pseudocode/) for normalized reconstructions with FACT / INFERENCE / HYPOTHESIS separated.
+See [`docs/function-map.md`](docs/function-map.md) for the build-specific function map and [`pseudocode/`](pseudocode/) for normalized reconstructions with FACT / INFERENCE / HYPOTHESIS kept separate.
 
-A DX12 sampler-descriptor optimization (`NemoDX12SamplerReuse v0.4`) has already demonstrated that a large amount of descriptor work is redundant and can be removed safely in the tested setup. It remains a candidate component of a final patch.
+A DX12 sampler-descriptor optimization (`NemoDX12SamplerReuse v0.4`) has already shown that a large amount of descriptor work is redundant and can be skipped safely in the tested setup. It remains a candidate component of a final patch.
 
 ## Help wanted
 
-Useful outside contributions would include:
+Useful outside contributions include:
 
 - identifying 1.58 counterparts of the mapped 1.60 functions
 - checking the resource/buffer/render path for changes introduced in 1.59/1.60
 - reviewing the normalized pseudocode and call-chain interpretation
 - suggesting low-risk instrumentation for exact per-call timing and repeat-rate measurements
-- reproducing the scene-dependent slowdown on other systems while keeping evidence separated from speculation
+- reproducing the scene-dependent slowdown on other systems with clearly documented conditions
 
-If you recognize one of the code patterns, an issue with the relevant build, address, evidence and reasoning is more useful than a generic performance suggestion.
+If you recognize one of the code patterns, please open an issue with the relevant build, address, evidence and reasoning. Concrete evidence is much more useful than generic performance suggestions.
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the format used in this project.
 
 ## Version policy
 
-- **1.60.1.7s** — runtime profiling, probes, patch experiments.
-- **1.58.1.4s** — static reverse-engineering reference only; it is **not run**. It is used as a pre-regression code snapshot for comparison with 1.60.
+- **1.60.1.7s** — runtime profiling, probes and patch experiments.
+- **1.58.1.4s** — static reverse-engineering reference only. It is **not run** and is used as a pre-regression comparison point.
 
 Reference hashes:
 
@@ -62,7 +62,7 @@ AB9785331BF9970542C61A0108A4E677C9F7C00FD316D4C0F9AB116F6BE6C234
 ```text
 .
 ├─ README.md
-├─ README_WORKSPACE.md
+├─ CONTRIBUTING.md
 ├─ docs/
 │  ├─ current-findings.md
 │  ├─ function-map.md
@@ -71,25 +71,21 @@ AB9785331BF9970542C61A0108A4E677C9F7C00FD316D4C0F9AB116F6BE6C234
 │  ├─ render-call-chain.md
 │  ├─ experiments.md
 │  └─ disproven-hypotheses.md
-├─ pseudocode/
-│  ├─ README.md
-│  ├─ 1.60/
-│  └─ 1.58/
-├─ ghidra/
-│  ├─ scripts/
-│  └─ mappings/
-├─ probes/
-├─ logs/
-│  └─ sanitized/
-└─ archive/
-   └─ old-handoffs/
+└─ pseudocode/
+   ├─ README.md
+   ├─ 1.60/
+   └─ 1.58/
 ```
+
+The public repository intentionally stays small. Large raw decompiler exports, Ghidra project databases, game binaries and local workspace files are not published here.
 
 ## Evidence policy
 
-Every result should record the build, function address, method, result, interpretation, confidence, and next step. Facts, inferences, and hypotheses must remain explicitly separated.
+Every result should record the build, function address, method, result, interpretation, confidence and next step.
 
-No SCS binaries/assets are to be committed. Prefer original analysis, normalized pseudocode, mappings, scripts, sanitized logs, and minimal excerpts necessary to explain findings.
+Facts, inferences and hypotheses must remain explicitly separated. Addresses are build-specific and must never be assumed to match across versions without re-identification.
+
+No SCS binaries or assets are committed. The repository contains original analysis, normalized pseudocode, mappings and research notes rather than bulk decompiler output.
 
 ## Runtime build currently under investigation
 
