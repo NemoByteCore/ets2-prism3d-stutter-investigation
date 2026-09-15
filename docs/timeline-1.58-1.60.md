@@ -1,5 +1,7 @@
 # 1.58 → 1.60 regression timeline
 
+Updated: **2026-09-16**
+
 ## Evidence categories
 
 Keep these separate:
@@ -46,7 +48,7 @@ The sustained slowdown was reproduced in 1.60:
 - strong scene dependence
 - unload/ferry/teleport can sometimes restore good behavior without restart
 
-Frame-pacing work showed the sustained slowdown is not primarily a DXGI/fence-wait problem; CPU-side work reaches submission/present too late.
+Frame-pacing work showed the previously measured DXGI/fence wait gates do not explain the sustained slowdown by themselves.
 
 ### Stage 2 — targeted descriptor/resource branch comparison
 
@@ -84,33 +86,83 @@ strong anchored 1.58-only: 375
 ambiguous unmatched regions: 3,370
 ```
 
-The global pass identified a broad 1.60 `p3mem` allocator/scope migration and a repeated `render_queue_set_t` copy path in normal frame construction as the strongest new steady-state candidate.
+The global pass identified a broad 1.60 `p3mem` allocator/scope migration and several regression-shaped candidates.
 
 See [`global-diff-summary.md`](global-diff-summary.md).
 
-### Stage 5 — current runtime discriminator
+### Stage 5 — runtime discrimination of top static candidates
 
-Current first target:
+The strongest-looking isolated candidates were tested before patching.
+
+#### `render_queue_set_t` copy helper
 
 ```text
 1.60.1.7s:0x14154AAB0
 ```
 
-The first experiment is intentionally narrow:
+Runtime result:
 
-- calls/window
-- queue-set count if safe/read-only
-- cheap ownership/refcount-heavy branch count if identifiable
-- correlation with naturally occurring good/heavy frametime windows
+```text
+14 direct calls across 24,798 rendered frames
+```
 
-Timing and patching follow only if the count-stage result is positive.
+Conclusion: strong static delta, but direct cost far too sparse to explain sustained multi-millisecond frame loss.
+
+#### `r_proto` lazy-resolution boundary
+
+```text
+1.60.1.7s:0x1413C1470
+```
+
+No direct `E8 rel32` callsites or incoming direct-call edge were found for the proposed hook boundary.
+
+Conclusion: repeat direct-call probing closed pending new reachability evidence.
+
+#### `traffic_trajectory_t::update_neighbors_bits`
+
+```text
+1.60.1.7s:0x1408DC510
+```
+
+Only 85 calls occurred in the full run, including 30 near shutdown/unload. The run still transitioned naturally from about `16.775 ms/frame` to `22.268 ms/frame`, with an approximately 42 s call-free interval centered on the heavy-state onset.
+
+Conclusion: direct execution cost at this target cannot explain the sustained heavy state.
+
+### Stage 6 — current runtime-first phase localization
+
+After repeated isolated negatives, the project pivoted to a coarse main-loop chain:
+
+```text
+0x1401C5280
+  -> 0x1401C77C0  LOOP
+       -> 0x1401C6CB0  PACE
+       -> 0x1401D72F0  RENDER
+            -> 0x14011F730  WAIT
+```
+
+`NemoFramePhaseProbe v0.1` produced two similar natural good→heavy transitions:
+
+```text
+transition A: LOOP +4.116 ms, RENDER +1.641 ms, OTHER +2.475 ms
+transition B: LOOP +3.745 ms, RENDER +2.007 ms, OTHER +1.738 ms
+```
+
+`PACE` stayed around `~0.001 ms/iteration`.
+
+A nested frame-time wait helper was then identified inside the broad RENDER bucket, so the current v0.2 probe separates `WAIT` from active render work.
+
+See [`runtime-phase-localization.md`](runtime-phase-localization.md).
 
 ## Current question
 
 The investigation is no longer asking only:
 
-> What changed in the descriptor path?
+> What changed between 1.58 and 1.60?
+
+The whole-corpus map already answers that at scale.
 
 The current question is:
 
-> Which of the confirmed 1.60 CPU-side changes actually accounts for a meaningful share of the missing ~3–8 ms/frame, and which state/world-lifetime changes explain why the slowdown can reset without restarting the process?
+> Which measured runtime phase actually gains the missing milliseconds in the heavy state, and what exact 1.58→1.60 code/data change inside that phase explains the measured budget?
+
+Static comparison now follows runtime localization instead of selecting the next leaf function by visual attractiveness alone.
