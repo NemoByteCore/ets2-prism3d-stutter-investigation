@@ -2,13 +2,13 @@
 
 Active reverse-engineering investigation of scene-dependent CPU-side stutter in **Euro Truck Simulator 2 1.60.1.7s** using the native DX12 renderer.
 
-> **Status:** the hypothesis-agnostic whole-corpus `1.58.1.4s ↔ 1.60.1.7s` static diff is complete. Several top-ranked static candidates were then demoted by runtime measurement, so the investigation has pivoted to **coarse main-loop phase localization** before choosing the next leaf function.
+> **Status:** the hypothesis-agnostic whole-corpus `1.58.1.4s ↔ 1.60.1.7s` static diff is complete. Runtime follow-up demoted several top-ranked isolated candidates, and coarse main-loop timing now shows that the sustained heavy-state delta is split between **active render-side CPU work** and **other main-loop work**. The measured sleep/spin wait helper does not explain the slowdown.
 
 ## What is being investigated
 
 On the tested system, light scenes can hold roughly **16.67 ms / 60 FPS**, while heavier scene compositions can move into roughly **19–25 ms**. The slowdown is scene-dependent and can sometimes disappear after an unload/ferry/teleport transition without restarting the game.
 
-Earlier runtime work showed that the sustained slowdown is **not primarily explained by the previously measured DXGI/fence wait gates**. Slow regions mainly contain more work rather than one obvious per-draw spike.
+Earlier runtime work showed that the sustained slowdown is not primarily explained by the previously measured DXGI/fence wait gates. Slow regions mainly contain more work rather than one obvious fixed stall.
 
 ## Whole-corpus diff status
 
@@ -25,42 +25,19 @@ ambiguous unmatched regions: 3,370
 
 See [`docs/global-diff-summary.md`](docs/global-diff-summary.md) for methodology and caveats.
 
-## Important runtime correction to the static ranking
+## Runtime correction to the static ranking
 
-The global diff found several attractive 1.60 changes, but runtime frequency checks showed that the strongest-looking individual candidates do **not** directly own the sustained frame budget.
+Three attractive isolated candidates were demoted by direct runtime evidence:
 
-### `render_queue_set_t` copy helper
+- `render_queue_set_t` copy helper `1.60.1.7s:0x14154AAB0`: only **14 direct calls across 24,798 rendered frames**;
+- `r_proto` boundary `1.60.1.7s:0x1413C1470`: no direct-call boundary for the proposed experiment;
+- `traffic_trajectory_t::update_neighbors_bits` `1.60.1.7s:0x1408DC510`: only **85 total calls**, with no calls for ~42 s centered on a natural heavy-state onset.
 
-```text
-1.60.1.7s:0x14154AAB0
-```
+These results are why the investigation switched from isolated static-candidate probing to runtime phase localization.
 
-This helper looked highly regression-shaped statically because the 1.60 implementation adds substantial p3mem-style ownership/refcount machinery. Runtime measurement, however, found only **14 direct calls across 24,798 rendered frames**.
+## Coarse main-loop localization
 
-The static delta is real; the sustained direct-cost theory is strongly demoted.
-
-### `r_proto` lazy-resolution boundary
-
-```text
-1.60.1.7s:0x1413C1470
-```
-
-No direct `E8 rel32` callsites or incoming direct-call edges were found for the proposed instrumentation boundary. This does not prove the entire subsystem irrelevant, but the original direct-call experiment is closed without new reachability evidence.
-
-### traffic neighbor update
-
-```text
-traffic_trajectory_t::update_neighbors_bits
-1.60.1.7s:0x1408DC510
-```
-
-The target executed only **85 times** in the whole run, including a 30-call shutdown/unload-adjacent burst. A natural transition from about **16.775 ms/frame** to **22.268 ms/frame** occurred across an approximately **42.17 s interval with no calls to the target at all**.
-
-That makes the direct execution cost far too sparse to explain the sustained heavy state.
-
-## First useful coarse localization result
-
-The current main-loop chain is:
+Current measured chain:
 
 ```text
 0x1401C5280  outer loop owner
@@ -69,39 +46,13 @@ The current main-loop chain is:
           -> 0x1401D72F0  rendergraph / present coordinator
 ```
 
-`NemoFramePhaseProbe v0.1` measured:
+`NemoFramePhaseProbe v0.2` additionally measures a nested timing helper:
 
 ```text
-LOOP   = main-loop iteration
-PACE   = frame-clock bookkeeping
-RENDER = broad rendergraph/present coordinator
-OTHER  = LOOP - PACE - RENDER
+WAIT = 0x14011F730
 ```
 
-Two separate natural good→heavy transitions showed similar growth:
-
-```text
-transition A: LOOP +4.116 ms, RENDER +1.641 ms, OTHER +2.475 ms
-transition B: LOOP +3.745 ms, RENDER +2.007 ms, OTHER +1.738 ms
-```
-
-`PACE` stayed around `~0.001 ms/iteration` and is effectively ruled out as the owner of the regression.
-
-This is the first measurement that consistently assigns a real part of the heavy-state delta to a broad CPU phase rather than an isolated static candidate.
-
-See [`docs/runtime-phase-localization.md`](docs/runtime-phase-localization.md).
-
-## Why RENDER is not yet the answer
-
-The broad `RENDER` bucket includes a nested frame-time wait helper at:
-
-```text
-1.60.1.7s:0x14011F730
-```
-
-That helper uses `Sleep()` plus a short spin phase. Therefore the observed `RENDER` delta can mix active render work with deliberate pacing wait.
-
-The current experiment, `NemoFramePhaseProbe v0.2`, separates that wait and derives:
+and derives:
 
 ```text
 RENDER_ACTIVE = RENDER - WAIT
@@ -109,7 +60,21 @@ OTHER         = LOOP - PACE - RENDER
 CPU_ACTIVE    = OTHER + RENDER_ACTIVE + PACE
 ```
 
-The next decision is based on where the missing milliseconds remain after `WAIT` is removed.
+Across clean ordinary-gameplay good (`LOOP <= 17 ms`) versus heavy (`LOOP >= 19 ms`) windows:
+
+```text
+             GOOD       HEAVY      DELTA
+LOOP         16.683 ms  20.358 ms  +3.675 ms
+RENDER_ACTIVE11.404 ms  13.507 ms  +2.103 ms
+OTHER         5.253 ms   6.840 ms  +1.586 ms
+WAIT          0.024 ms   0.009 ms  -0.015 ms / loop
+```
+
+The sleep/spin helper is conditional and sparse (`2,092` calls vs `33,339` main-loop calls) and contributes only tens of microseconds per normal gameplay loop.
+
+**Current coarse split:** roughly **57% active render-side work / 43% other main-loop work**.
+
+See [`docs/runtime-phase-localization.md`](docs/runtime-phase-localization.md).
 
 ## Descriptor/root-binding branch: still real, not the whole theory
 
@@ -125,11 +90,11 @@ Do not return to broad static candidate roulette or broad per-D3D-call tracing.
 
 Current order:
 
-1. finish `WAIT` separation with the phase probe;
-2. identify whether the heavy delta sits in `RENDER_ACTIVE`, `OTHER`, or both;
-3. if coarse timing is still insufficient, compare differential CPU stack samples between sustained good and heavy windows;
-4. add state/cardinality counters only inside the phase that actually owns the missing time;
-5. map the measured hotspot back to the completed 1.58 ↔ 1.60 counterpart map;
+1. subdivide `RENDER_ACTIVE` inside `0x1401D72F0` around stable low-overhead boundaries;
+2. subdivide `OTHER` inside `0x1401C77C0` into stable pre/post-render or equivalent subphases;
+3. if the cost remains distributed, compare differential CPU stack samples between sustained good and heavy windows;
+4. add state/cardinality counters only inside the measured winning subphase;
+5. map the measured hotspot back to the completed `1.58 ↔ 1.60` counterpart set;
 6. patch only after a measured millisecond budget exists.
 
 ## Help wanted
@@ -137,10 +102,10 @@ Current order:
 Useful outside contributions are welcome, especially:
 
 - independent reproduction of the scene-dependent slowdown
-- review of the current main-loop / wait boundary interpretation
+- review of the current main-loop / render-active split
 - low-overhead Windows x64 stack-sampling ideas suitable for good-vs-heavy differential analysis
 - corrections to build-specific function mappings
-- alternative explanations for the measured `OTHER` / active-render split
+- alternative explanations for a shared scene/state driver increasing both `RENDER_ACTIVE` and `OTHER`
 
 Please keep **FACT / INFERENCE / HYPOTHESIS** separate and identify the exact build for every address.
 
@@ -149,7 +114,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 ## Start here
 
 - [`docs/current-findings.md`](docs/current-findings.md) — current technical state
-- [`docs/runtime-phase-localization.md`](docs/runtime-phase-localization.md) — latest runtime pivot and phase results
+- [`docs/runtime-phase-localization.md`](docs/runtime-phase-localization.md) — latest runtime phase results
 - [`docs/global-diff-summary.md`](docs/global-diff-summary.md) — completed whole-corpus 1.58 ↔ 1.60 comparison
 - [`docs/function-map.md`](docs/function-map.md) — build-specific function map
 - [`docs/shader-profile-architecture-delta.md`](docs/shader-profile-architecture-delta.md) — descriptor/root-binding branch
