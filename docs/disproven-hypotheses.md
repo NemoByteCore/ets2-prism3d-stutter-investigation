@@ -1,22 +1,70 @@
 # Disproven / closed / demoted hypotheses
 
+Updated: **2026-09-16**
+
 Do not revisit these without new hard evidence, a changed build, or a materially better measurement method.
 
 ## Closed as primary root causes
 
-- `g_traffic` A/B
+- `g_traffic` A/B as an explanation rather than a workload amplifier
 - generic graphics/config tweaks
 - texture budget/cache
 - DXVK
 - online services
-- frame fence / DXGI wait
-- Prism sleep
+- previously measured frame fence / DXGI wait gates
+- Prism sleep as the complete root cause
 - stale instance result reuse
-- defrag as the main root cause
+- defrag as the established main root cause
 - old resource descriptor v0.5 implementation
 - full descriptor-builder memo v0.2
 - resource-table reuse v0.3 as implemented by the old decoder
 - DirectStorage as a newly introduced 1.60 feature
+
+## Newly runtime-demoted direct-cost theories
+
+These are important because they were plausible from static analysis but failed runtime frequency/reachability tests.
+
+### `render_queue_set_t` copy helper — direct sustained-cost theory
+
+Target:
+
+```text
+1.60.1.7s:0x14154AAB0
+```
+
+The 1.60 function is materially larger than its 1.58 counterpart and contains new p3mem-style ownership/refcount machinery.
+
+Runtime measurement found only:
+
+```text
+14 direct executions across 24,798 rendered frames
+```
+
+**Conclusion:** the static delta is real, but direct execution of this helper cannot explain a sustained multi-millisecond-per-frame regression. Do not deepen this branch without new evidence that identifies a different active path or side effect.
+
+### `r_proto` lazy mask-resolution boundary — repeat direct-call probing
+
+Target:
+
+```text
+1.60.1.7s:0x1413C1470
+```
+
+A whole-executable scan found no direct `E8 rel32` callsites to the proposed target, and the harvested call graph contains no incoming direct-call edge for that exact boundary.
+
+**Conclusion:** do not repeat the same direct-call probe. Indirect/tail/inlined use is not disproven, but a new experiment requires new reachability evidence first.
+
+### `traffic_trajectory_t::update_neighbors_bits` — direct sustained-cost theory
+
+Target:
+
+```text
+1.60.1.7s:0x1408DC510
+```
+
+The runtime probe observed only 85 calls in the full run, including a 30-call shutdown/unload-adjacent burst. The same run captured a natural heavy-state onset across an approximately 42.17 s interval with no calls to the target.
+
+**Conclusion:** the direct execution cost is far too sparse to own the sustained frame budget. The path remains valid evidence that p3mem reaches active gameplay code, but not a leading direct-cost root cause.
 
 ## Lower-priority / demoted, not fully disproven
 
@@ -119,3 +167,18 @@ The observation that cabin -> third-person can sometimes appear to improve a bad
 A marker-enabled run recorded real camera changes but did not reproduce the sustained heavy state.
 
 **Conclusion:** keep camera events as passive context only. Do not build camera-specific instrumentation unless a heavy-state transition is actually aligned with a camera event.
+
+## Current anti-tunnel rule
+
+After several isolated static candidates failed runtime frequency/reachability tests, do not select the next leaf function solely because it has a large 1.58→1.60 delta.
+
+Current order is:
+
+```text
+runtime phase localization
+  -> differential stack/counter work inside the phase that owns the missing time
+  -> exact static comparison of that measured hotspot
+  -> patch
+```
+
+See [`runtime-phase-localization.md`](runtime-phase-localization.md).
