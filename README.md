@@ -2,19 +2,15 @@
 
 Active reverse-engineering investigation of scene-dependent CPU-side stutter in **Euro Truck Simulator 2 1.60.1.7s** using the native DX12 renderer.
 
-> **Status:** the hypothesis-agnostic whole-corpus `1.58.1.4s ↔ 1.60.1.7s` static diff is complete. The next stage is a narrow runtime discriminator for the strongest new steady-state candidate, not another broad profiler.
+> **Status:** the hypothesis-agnostic whole-corpus `1.58.1.4s ↔ 1.60.1.7s` static diff is complete. Several top-ranked static candidates were then demoted by runtime measurement, so the investigation has pivoted to **coarse main-loop phase localization** before choosing the next leaf function.
 
 ## What is being investigated
 
 On the tested system, light scenes can hold roughly **16.67 ms / 60 FPS**, while heavier scene compositions can move into roughly **19–25 ms**. The slowdown is scene-dependent and can sometimes disappear after an unload/ferry/teleport transition without restarting the game.
 
-Runtime work shows that the sustained slowdown is **not primarily a DXGI wait / fence-wait problem**. The CPU reaches submission/present too late; the interesting work happens earlier in render/simulation construction.
-
-Slow active-gameplay regions mainly show **more work**, not one obvious per-draw explosion. This favors repeated per-item/per-draw/per-queue CPU costs that scale with scene complexity.
+Earlier runtime work showed that the sustained slowdown is **not primarily explained by the previously measured DXGI/fence wait gates**. Slow regions mainly contain more work rather than one obvious per-draw spike.
 
 ## Whole-corpus diff status
-
-The static comparison is no longer limited to the previously mapped descriptor branch.
 
 ```text
 1.58 functions: 66,820
@@ -27,66 +23,97 @@ strong anchored 1.58-only: 375
 ambiguous unmatched regions: 3,370
 ```
 
-Unmatched functions are deliberately not all called new/removed. See [`docs/global-diff-summary.md`](docs/global-diff-summary.md) for methodology, caveats and the current ranking.
+See [`docs/global-diff-summary.md`](docs/global-diff-summary.md) for methodology and caveats.
 
-## Strongest new candidate
+## Important runtime correction to the static ranking
 
-The global pass found a very high-confidence `render_queue_set_t` copy counterpart:
+The global diff found several attractive 1.60 changes, but runtime frequency checks showed that the strongest-looking individual candidates do **not** directly own the sustained frame budget.
 
-```text
-1.58.1.4s:0x1413D5830   516 B
-1.60.1.7s:0x14154AAB0  1370 B
-```
-
-The 1.60 implementation performs the same broad copy/append role but contains substantial new p3mem-style ownership/refcount machinery.
-
-It is reached from a strongly conserved render-frame construction path:
+### `render_queue_set_t` copy helper
 
 ```text
-1.58.1.4s:0x141213E40  7503 B
-1.60.1.7s:0x1413C1AE0  7503 B
+1.60.1.7s:0x14154AAB0
 ```
 
-The caller invokes the helper in a queue-set loop plus two additional calls outside the loop.
+This helper looked highly regression-shaped statically because the 1.60 implementation adds substantial p3mem-style ownership/refcount machinery. Runtime measurement, however, found only **14 direct calls across 24,798 rendered frames**.
 
-This is currently the strongest new **steady-state regression-shaped static candidate**, but its runtime cost has not yet been measured. It is not presented as a confirmed root cause.
+The static delta is real; the sustained direct-cost theory is strongly demoted.
 
-## Broader 1.60 `p3mem` migration
-
-The global diff also found a cross-cutting allocator/scope migration:
+### `r_proto` lazy-resolution boundary
 
 ```text
-direct _malloc_base calls:
-1.58: 4,212
-1.60:   260
-
-1.60 p3_alloc path:        0x140117240  (~1,485 static incoming edges)
-1.60 scope lifetime/free:  0x140117400  (~3,828 static incoming edges)
+1.60.1.7s:0x1413C1470
 ```
 
-Among a conservative mapped set, `390 / 392` 1.60 `p3_alloc` callers have 1.58 counterparts using `_malloc_base`.
+No direct `E8 rel32` callsites or incoming direct-call edges were found for the proposed instrumentation boundary. This does not prove the entire subsystem irrelevant, but the original direct-call experiment is closed without new reachability evidence.
 
-The migration reaches active render and traffic paths, but static prevalence alone does not establish frametime cost.
-
-## Descriptor/root-binding branch: still real, no longer the whole theory
-
-The mapped 1.58/1.60 DX12 binding architecture difference remains confirmed:
+### traffic neighbor update
 
 ```text
-1.58:
-actual pipeline layout
-→ layout-specific root signature/capacity
-→ compact resource + sampler tables
-
-1.60:
-RFX shader profile
-→ one of 13 fixed root-signature profiles
-→ fixed capacities
-→ individual root CBVs + split per-set tables
-→ generalized root-parameter submission
+traffic_trajectory_t::update_neighbors_bits
+1.60.1.7s:0x1408DC510
 ```
 
-Runtime probing confirmed large fixed-capacity over-reservation. `NemoDX12SamplerAllocReuse` safely avoids roughly **95%** of targeted sampler allocation/copy pressure.
+The target executed only **85 times** in the whole run, including a 30-call shutdown/unload-adjacent burst. A natural transition from about **16.775 ms/frame** to **22.268 ms/frame** occurred across an approximately **42.17 s interval with no calls to the target at all**.
+
+That makes the direct execution cost far too sparse to explain the sustained heavy state.
+
+## First useful coarse localization result
+
+The current main-loop chain is:
+
+```text
+0x1401C5280  outer loop owner
+    -> 0x1401C77C0  main-loop iteration
+          -> 0x1401C6CB0  frame-clock / duration bookkeeping
+          -> 0x1401D72F0  rendergraph / present coordinator
+```
+
+`NemoFramePhaseProbe v0.1` measured:
+
+```text
+LOOP   = main-loop iteration
+PACE   = frame-clock bookkeeping
+RENDER = broad rendergraph/present coordinator
+OTHER  = LOOP - PACE - RENDER
+```
+
+Two separate natural good→heavy transitions showed similar growth:
+
+```text
+transition A: LOOP +4.116 ms, RENDER +1.641 ms, OTHER +2.475 ms
+transition B: LOOP +3.745 ms, RENDER +2.007 ms, OTHER +1.738 ms
+```
+
+`PACE` stayed around `~0.001 ms/iteration` and is effectively ruled out as the owner of the regression.
+
+This is the first measurement that consistently assigns a real part of the heavy-state delta to a broad CPU phase rather than an isolated static candidate.
+
+See [`docs/runtime-phase-localization.md`](docs/runtime-phase-localization.md).
+
+## Why RENDER is not yet the answer
+
+The broad `RENDER` bucket includes a nested frame-time wait helper at:
+
+```text
+1.60.1.7s:0x14011F730
+```
+
+That helper uses `Sleep()` plus a short spin phase. Therefore the observed `RENDER` delta can mix active render work with deliberate pacing wait.
+
+The current experiment, `NemoFramePhaseProbe v0.2`, separates that wait and derives:
+
+```text
+RENDER_ACTIVE = RENDER - WAIT
+OTHER         = LOOP - PACE - RENDER
+CPU_ACTIVE    = OTHER + RENDER_ACTIVE + PACE
+```
+
+The next decision is based on where the missing milliseconds remain after `WAIT` is removed.
+
+## Descriptor/root-binding branch: still real, not the whole theory
+
+The mapped 1.58/1.60 DX12 binding architecture difference remains confirmed. Runtime probing found large fixed-capacity over-reservation, and `NemoDX12SamplerAllocReuse` safely avoids roughly **95%** of targeted sampler allocation/copy pressure.
 
 However, sustained heavy-scene slowdown still occurs with that optimization active. The descriptor branch is therefore a real optimization/regression component, **not a complete explanation**.
 
@@ -94,32 +121,26 @@ See [`docs/shader-profile-architecture-delta.md`](docs/shader-profile-architectu
 
 ## Current next step
 
-Do **not** repeat `NemoShaderProfileProbe v0.2` as a broad performance profiler; its direct D3D hooks create a substantial observer effect.
+Do not return to broad static candidate roulette or broad per-D3D-call tracing.
 
-The next runtime test is a minimal probe around:
+Current order:
 
-```text
-1.60.1.7s:0x14154AAB0
-```
-
-First measure only low-overhead values during ordinary gameplay:
-
-- helper calls per synchronized frametime window
-- queue-set count if safe/read-only
-- cheap count of the ownership/refcount-heavy path if identifiable
-- natural unload/ferry/teleport transitions as context
-
-If those values correlate with the ~16.7 ms → ~20–25 ms state change, follow with aggregate/sampled timing. If not, demote the candidate immediately and continue down the global ranking.
+1. finish `WAIT` separation with the phase probe;
+2. identify whether the heavy delta sits in `RENDER_ACTIVE`, `OTHER`, or both;
+3. if coarse timing is still insufficient, compare differential CPU stack samples between sustained good and heavy windows;
+4. add state/cardinality counters only inside the phase that actually owns the missing time;
+5. map the measured hotspot back to the completed 1.58 ↔ 1.60 counterpart map;
+6. patch only after a measured millisecond budget exists.
 
 ## Help wanted
 
 Useful outside contributions are welcome, especially:
 
-- review of the new whole-corpus mapping and `render_queue_set` counterpart
 - independent reproduction of the scene-dependent slowdown
-- low-overhead ideas for measuring a very hot helper without per-call logging
-- review of p3mem ownership semantics in the mapped frame path
+- review of the current main-loop / wait boundary interpretation
+- low-overhead Windows x64 stack-sampling ideas suitable for good-vs-heavy differential analysis
 - corrections to build-specific function mappings
+- alternative explanations for the measured `OTHER` / active-render split
 
 Please keep **FACT / INFERENCE / HYPOTHESIS** separate and identify the exact build for every address.
 
@@ -128,6 +149,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 ## Start here
 
 - [`docs/current-findings.md`](docs/current-findings.md) — current technical state
+- [`docs/runtime-phase-localization.md`](docs/runtime-phase-localization.md) — latest runtime pivot and phase results
 - [`docs/global-diff-summary.md`](docs/global-diff-summary.md) — completed whole-corpus 1.58 ↔ 1.60 comparison
 - [`docs/function-map.md`](docs/function-map.md) — build-specific function map
 - [`docs/shader-profile-architecture-delta.md`](docs/shader-profile-architecture-delta.md) — descriptor/root-binding branch
