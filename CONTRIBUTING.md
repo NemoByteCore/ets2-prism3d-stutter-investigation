@@ -1,104 +1,123 @@
 # Contributing
 
-This repository is an evidence-driven reverse-engineering investigation. Contributions are welcome when they help verify the 1.58 ↔ 1.60 architecture delta, improve runtime instrumentation, reproduce the slowdown, or correct the current function/pseudocode model.
+This repository is an evidence-driven reverse-engineering investigation. Contributions are welcome when they help verify build-specific mappings, reproduce the slowdown, improve low-overhead instrumentation, or challenge the current runtime model with concrete evidence.
 
 ## Best ways to help right now
 
-Current high-value contribution areas:
+### 1. Review the new whole-corpus diff
 
-1. **Runtime instrumentation review**
-   - low-overhead measurement of actual rendered frametime
-   - profile-aware draw/work counters
-   - actual descriptor writes/copies
-   - actual `SetGraphicsRoot*` calls
-   - root-signature/profile switches
-   - descriptor heap rollover/switch events
+The `1.58.1.4s ↔ 1.60.1.7s` global comparison is summarized in [`docs/global-diff-summary.md`](docs/global-diff-summary.md).
 
-2. **Shader-tuple/profile invariant audit**
-   - determine whether the same six-shader tuple can ever be requested with more than one 1.60 shader-profile ID
-   - this is an audit target, **not a confirmed cache bug**
+High-value review targets:
 
-3. **Independent reproduction**
-   - reproduce scene-dependent CPU-side slowdown on another system
-   - document exact game build, renderer, settings and hardware
-   - distinguish measured frametime from subjective impressions
+- `render_queue_set_t` copy counterpart:
+  - `1.58.1.4s:0x1413D5830`
+  - `1.60.1.7s:0x14154AAB0`
+- preserved frame-render caller:
+  - `1.58.1.4s:0x141213E40`
+  - `1.60.1.7s:0x1413C1AE0`
+- p3mem allocator/scope interpretation
+- `r_proto` lazy render-queue mask resolution:
+  - `1.58.1.4s:0x141213A20`
+  - `1.60.1.7s:0x1413C1470`
 
-4. **Static review**
-   - review the mapped 1.58 ↔ 1.60 descriptor/root-binding path
-   - challenge function identifications or architecture interpretations with concrete evidence
+Corrections to mappings are explicitly welcome.
+
+### 2. Low-overhead runtime instrumentation
+
+The next runtime question is deliberately narrow: does `1.60.1.7s:0x14154AAB0` consume meaningful CPU time and scale with naturally occurring heavy frametime windows?
+
+Useful ideas should avoid per-call logging in a very hot path. Preferred sequence:
+
+```text
+count calls / branch entries
+-> correlate with rendered frametime
+-> aggregate or sampled timing if positive
+-> patch only after material cost is measured
+```
+
+### 3. Independent reproduction
+
+Useful reports include:
+
+- exact ETS2 build
+- renderer
+- CPU/GPU/driver/OS
+- resolution/scaling and relevant graphics settings
+- actual rendered frametime in good/heavy regions
+- whether unload/ferry/teleport changes the state without restart
+- measurement method
+
+Distinguish measured values from subjective impressions.
+
+### 4. Review retained descriptor/root-binding work
+
+The mapped shader-profile/descriptor architecture remains valid and runtime-relevant, but it is no longer treated as the complete root-cause theory.
+
+Review is still useful when it challenges a concrete mapping or proposes a low-overhead measurement.
 
 ## Good contributions
 
-Useful reports usually contain:
+Useful static reports usually contain:
 
-- exact ETS2 build
+- exact build
 - executable hash when relevant
-- function address(es) with the build clearly stated
+- build-specific function address(es)
 - how the function was identified
-- callers/callees, strings, types or dataflow that support the identification
-- whether the claim is a **FACT**, **INFERENCE** or **HYPOTHESIS**
+- callers/callees, strings, types or dataflow supporting the mapping
+- **FACT / INFERENCE / HYPOTHESIS** separation
 - confidence level
-- what the finding changes or what should be tested next
+- evidence against / uncertainty
+- what measurement would discriminate the claim
 
 For runtime measurements, also include:
 
-- renderer
-- relevant graphics/settings state
+- renderer and relevant settings
 - hardware
-- how actual rendered frametime was measured
-- whether a number is a direct API/engine event or an inferred counter
+- how rendered frametime was measured
+- whether a number is a direct event, decoded/inferred counter, aggregate duration or sample
 
-## Current build policy
+## Build policy
 
 - `1.60.1.7s` — runtime profiling, probes and patch experiments
-- `1.58.1.4s` — static-only pre-regression reference; it is **not run**
+- `1.58.1.4s` — static-only pre-regression reference; it is **never run**
 
-Addresses are build-specific. Never assume an address or function identity carries across versions without re-identification.
+Addresses are build-specific. Never carry an address/function identity between versions without re-identification.
 
 ## Runtime experiment constraint
 
-The active save does not provide arbitrary control over test scenes. Please do not propose experiments that require hand-picked repeatable light/heavy saves or arbitrary teleporting solely for testing.
+The active test workflow does not depend on hand-picked repeatable light/heavy saves.
 
-Preferred experiments work during one ordinary gameplay session and correlate synchronized counters with actual rendered frametime afterward.
+Preferred experiments work during one ordinary gameplay session and correlate synchronized counters with independently measured rendered frametime afterward.
+
+Natural unload/ferry/teleport transitions are useful evidence because the slowdown can sometimes reset without process restart.
 
 See [`docs/methodology.md`](docs/methodology.md).
 
 ## Please avoid
 
-- uploading SCS executables, assets or other proprietary game files
+- uploading SCS executables, assets or other proprietary files
 - bulk raw decompiler dumps
-- presenting speculation as a confirmed cause
-- treating reserved descriptor capacity as proof of actual descriptor writes
-- treating predicted root-binding activity as equivalent to directly hooked API calls
-- repeating already-closed hypotheses without new evidence
-- generic optimization advice unrelated to the measured path
+- presenting a static candidate as a confirmed performance cause
+- treating code-site `LOCK/UNLOCK` counts as executed-per-call counts
+- treating reserved descriptor capacity as actual writes
+- broad direct-D3D hooking when a narrow counter can answer the question
+- global p3mem patches before path-specific runtime measurement
+- repeating closed/demoted hypotheses without new evidence
+- generic optimization advice unrelated to a measured path
 
 ## Pseudocode
 
 Pseudocode in this repository is intentionally normalized and structural. It should explain the behavior relevant to the investigation without reproducing large raw decompiler listings.
 
-When adding or correcting pseudocode, keep these categories separate where applicable:
-
-```text
-FACT
-INFERENCE
-HYPOTHESIS
-```
-
 ## Opening an issue
 
-Use a concise, evidence-oriented title, for example:
+Useful title examples:
 
 ```text
-[1.60] Profile-aware timing around descriptor update path
-```
-
-```text
-[1.58/1.60] Review of mapped root-signature construction delta
-```
-
-```text
+[1.60] Low-overhead counter for render_queue_set copy path
+[1.58/1.60] Review of render_queue_set counterpart mapping
 [Repro] Scene-dependent slowdown on Ryzen / Radeon system
 ```
 
-Include the minimum evidence needed for another person to reproduce, verify or challenge the result. Corrections are explicitly welcome; working function names in this repository are research labels unless stated otherwise.
+Include the minimum evidence needed for another person to reproduce, verify or challenge the result.
