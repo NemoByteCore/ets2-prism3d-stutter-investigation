@@ -1,6 +1,6 @@
 # Whole-corpus 1.58 → 1.60 diff summary
 
-Updated: **2026-09-15**
+Updated: **2026-09-16**
 
 This document summarizes the completed hypothesis-agnostic static comparison between ETS2 `1.58.1.4s` and `1.60.1.7s`.
 
@@ -60,7 +60,7 @@ Among a conservative set of mapped callers, `390 / 392` functions using the 1.60
 
 Decompiler-visible atomic/refcount signatures also increase substantially in 1.60. This is strong evidence of a cross-cutting allocator/scope/ownership migration, but static prevalence alone does not establish material frametime cost.
 
-## Strongest new steady-state candidate: `render_queue_set_t` copy path
+## Strongest static regression-shaped candidate found by the pass
 
 Very high-confidence counterpart:
 
@@ -89,26 +89,38 @@ normalized similarity ≈ 0.980
 outgoing calls: 56 -> 56
 ```
 
-That caller contains the same broad frame-render flow and invokes the copy helper once per queue-set element in a preserved loop, plus two additional helper calls outside the loop.
+That caller contains the same broad frame-render flow and invokes the copy helper in a preserved queue-set path.
 
-**FACT:** the repeated frame path is preserved while the 1.60 copy helper is materially heavier and ownership-aware.
+### Runtime follow-up
 
-**HYPOTHESIS:** the added per-copy ownership/refcount work may contribute measurable CPU render-construction cost in complex scenes.
+The static mapping remains high confidence, but the direct-cost hypothesis did **not** survive runtime frequency measurement.
 
-Runtime frequency and cost have not yet been measured, so this is **not a confirmed root cause**.
+`NemoRenderQueueProbe v0.2` found only:
 
-## Other ranked candidates
+```text
+14 direct calls across 24,798 rendered frames
+```
 
-### Broader active-runtime `p3mem` use
+**Conclusion:** this remains a valid and interesting 1.58→1.60 code delta, but direct execution of the helper cannot explain a sustained `+3–8 ms/frame` regression.
 
-The migration also reaches active traffic code. A mapped `traffic_trajectory_t::update_neighbors_bits` path grows from:
+This is an important methodological result: a very strong static regression shape can still be irrelevant to the sustained runtime budget if its active frequency is too low.
+
+## Other global-diff candidates and runtime follow-up
+
+### Active-runtime `p3mem` example
+
+Mapped `traffic_trajectory_t::update_neighbors_bits` path:
 
 ```text
 1.58.1.4s:0x140815880  500 B
 1.60.1.7s:0x1408DC510  774 B
 ```
 
-The 1.60 version adds scope-backed temporary storage/refcount handling. Execution frequency and cost remain unmeasured.
+The 1.60 version adds scope-backed temporary storage/refcount handling.
+
+Runtime follow-up found only 85 total calls in the measured run, including a 30-call shutdown/unload-adjacent burst. A natural heavy-state onset occurred across an approximately 42 s interval with no calls to the target.
+
+**Conclusion:** the path proves that the p3mem migration reaches active gameplay code, but this particular function is strongly demoted as a sustained direct-cost root cause.
 
 ### Existing shader-profile / descriptor / root-binding architecture
 
@@ -125,7 +137,9 @@ Strong mapped pair:
 1.60.1.7s:0x1413C1470  1463 B
 ```
 
-1.60 adds lazy resolution when the cached mask is `0xFFFFFFFF`, writes the resolved value back, then continues queue filtering. Because the result is cached, this is currently more plausible as a first-use/streaming component than a permanent every-frame cost.
+1.60 adds lazy resolution when the cached mask is `0xFFFFFFFF`, writes the resolved value back, then continues queue filtering.
+
+The proposed exact 1.60 instrumentation boundary has no direct `E8 rel32` callsites and no incoming direct-call edge in the harvested graph. This does not disprove indirect/tail/inlined use, but the original direct-call experiment is closed without new reachability evidence.
 
 ### DX12 resource allocator / TLSF / defragmentation
 
@@ -144,41 +158,59 @@ The global pass also prevented several large static deltas from being over-ranke
 
 See [`disproven-hypotheses.md`](disproven-hypotheses.md) for closed/demoted directions.
 
-## Current symptom-driven model
+## What changed after the runtime negatives
 
-The evidence currently fits a cumulative model better than a single static bug:
+The whole-corpus diff is **not discarded**. Its role changed.
 
-```text
-heavy scene / more active work
-  -> more repeated 1.60 CPU-side infrastructure work
-     - render_queue ownership/refcount
-     - descriptor/root-binding overhead
-     - possibly other active p3mem paths
-  -> render construction reaches submit/present later
-
-world rebuild / unload / ferry
-  -> active scene/queue/scope state changes or is rebuilt
-  -> repeated work can drop
-  -> good ~16.67 ms behavior can return without process restart
-```
-
-This is a framework for experiments, not proof of causality.
-
-## Next runtime discriminator
-
-The next probe should be deliberately narrow around:
+Old workflow:
 
 ```text
-1.60.1.7s:0x14154AAB0
+static ranking -> choose next isolated candidate -> runtime probe
 ```
 
-First collect low-overhead counts aligned with existing rendered-frametime windows:
+Current workflow:
 
-- helper calls/window
-- queue-set count from the preserved caller if safe/read-only
-- cheap count of ownership/refcount-heavy branch entries if identifiable
-- passive transition/camera markers only as context
+```text
+runtime phase localization
+  -> identify the phase that owns the missing milliseconds
+  -> differential stack/counter work inside that phase
+  -> use the 58,589-pair counterpart map to compare the measured hotspot
+  -> patch only after the runtime budget is quantified
+```
 
-Only if count/branch behavior correlates with naturally occurring heavy windows should aggregate or sampled timing be added.
+This is a better use of the completed static map than continuing to select functions by size/novelty alone.
 
-Do not return to a broad per-D3D-call profiler.
+## Current runtime localization result
+
+`NemoFramePhaseProbe v0.1` measures a main-loop chain around:
+
+```text
+0x1401C77C0  LOOP
+0x1401C6CB0  PACE
+0x1401D72F0  RENDER
+```
+
+Two separate natural good→heavy transitions showed:
+
+```text
+transition A: LOOP +4.116 ms, RENDER +1.641 ms, OTHER +2.475 ms
+transition B: LOOP +3.745 ms, RENDER +2.007 ms, OTHER +1.738 ms
+```
+
+`PACE` stayed around `~0.001 ms/iteration`.
+
+The broad `RENDER` bucket contains a nested deliberate frame-time wait helper at `1.60.1.7s:0x14011F730`, so the next probe separates `WAIT` from active render work.
+
+See [`runtime-phase-localization.md`](runtime-phase-localization.md).
+
+## Current question
+
+The investigation is no longer asking:
+
+> Which static delta looks most suspicious?
+
+It is asking:
+
+> Which coarse runtime phase actually gains the missing milliseconds in the heavy state, and what exact 1.58→1.60 code/data change inside that measured phase explains the delta?
+
+Do not return to broad per-D3D-call profiling or generic p3mem hooks without new evidence.
