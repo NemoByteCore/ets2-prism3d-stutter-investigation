@@ -32,25 +32,7 @@ On the tested setup:
 - severity strongly depends on scene composition
 - unload/ferry/teleport transitions can sometimes restore ~16.67 ms without restarting the game
 
-The camera-switch observation remains subjective/unresolved and is not used as the primary theory.
-
-## Confirmed runtime constraints
-
-Earlier frame-pacing probes showed that the previously measured DXGI/fence wait gates are too small to explain the sustained slowdown by themselves.
-
-A broad structural probe also showed that slow active-gameplay regions mainly contain **more work**, approximately:
-
-```text
-draws                  +37.6%
-resource copy activity +50.2%
-sampler copy activity  +46.3%
-root CBV calls          +37.3%
-root table calls        +38.2%
-```
-
-Per-draw rates remained comparatively flat. This favors costs that scale with active scene work rather than one isolated fixed stall.
-
-## Whole-corpus 1.58 ↔ 1.60 diff is complete
+## Whole-corpus diff status
 
 ```text
 1.58 function inventory: 66,820
@@ -66,80 +48,41 @@ ambiguous unmatched regions: 3,370
 
 See [`global-diff-summary.md`](global-diff-summary.md).
 
-## Runtime follow-up demoted the strongest isolated static candidates
+## Strong isolated static candidates were demoted by runtime measurement
 
 ### `render_queue_set_t` copy helper
 
-Static pair:
-
 ```text
-1.58.1.4s:0x1413D5830   516 B
-1.60.1.7s:0x14154AAB0  1370 B
+1.60.1.7s:0x14154AAB0
 ```
 
-The 1.60 helper contains substantial new p3mem-style ownership/refcount machinery and was initially the strongest steady-state static candidate.
+Despite a strong 1.58/1.60 static delta, runtime measurement found only **14 direct calls across 24,798 rendered frames**.
 
-`NemoRenderQueueProbe v0.2` found only **14 direct calls across 24,798 rendered frames**:
+**Decision:** strongly demote the direct-cost theory.
 
-```text
-0x013C2A22 = 12
-0x013C3289 = 1
-0x013C329D = 1
-0x0145CF47 = 0
-0x0154E4C4 = 0
-```
-
-**FACT:** the static delta is real.
-
-**FACT:** direct runtime activity is far too sparse to explain a sustained multi-millisecond-per-frame regression.
-
-**Decision:** strongly demote the direct-cost theory. Do not rescue it without new evidence.
-
-### `r_proto` lazy queue-mask resolution boundary
-
-Mapped pair:
+### `r_proto` lazy-resolution boundary
 
 ```text
-1.58.1.4s:0x141213A20   869 B
-1.60.1.7s:0x1413C1470  1463 B
+1.60.1.7s:0x1413C1470
 ```
 
-A whole-executable direct-call scan found no `E8 rel32` calls to the proposed 1.60 target. The harvested call graph also contains no incoming direct-call edge for that boundary.
+No direct `E8 rel32` callsites or incoming direct-call edges were found for the proposed instrumentation boundary.
 
-**Decision:** the proposed direct-call experiment is closed. Indirect/tail/inlined use is not ruled out, but a new runtime attempt requires new reachability evidence first.
+**Decision:** do not repeat the same direct-call probe without new reachability evidence.
 
 ### `traffic_trajectory_t::update_neighbors_bits`
 
-Mapped pair:
-
 ```text
-1.58.1.4s:0x140815880  500 B
-1.60.1.7s:0x1408DC510  774 B
+1.60.1.7s:0x1408DC510
 ```
 
-Four direct callsites were validated. Runtime totals:
+The target executed only **85 times** in the whole run, including a 30-call shutdown/unload-adjacent burst. A natural transition from about **16.775 ms/frame** to **22.268 ms/frame** occurred across an approximately **42.17 s interval with no calls to the target at all**.
 
-```text
-total calls = 85
-ordinary gameplay calls ≈ 55
-shutdown/unload-adjacent burst = 30
-```
+**Decision:** direct execution cost is far too sparse to own the sustained frame budget.
 
-The same run captured a clean natural transition:
+## Runtime-first phase localization
 
-```text
-baseline weighted mean ≈ 16.775 ms/frame
-heavy weighted mean    ≈ 22.268 ms/frame
-sustained delta        ≈ +5.49 ms/frame
-```
-
-There was an approximately **42.17 s call-free interval centered on the heavy-state onset**.
-
-**Decision:** direct execution cost at this target cannot plausibly own the sustained frame budget. The later increase in call rate is more likely a symptom of a busier scene than the direct cause.
-
-## Current pivot: coarse main-loop phase localization
-
-The active runtime chain is now:
+The current main-loop chain is:
 
 ```text
 0x1401C5280  outer loop owner
@@ -148,65 +91,21 @@ The active runtime chain is now:
           -> 0x1401D72F0  rendergraph / present coordinator
 ```
 
-`NemoFramePhaseProbe v0.1` measures:
+`NemoFramePhaseProbe v0.1` first showed that heavy-state growth is split between the broad render coordinator and residual main-loop work.
 
-```text
-LOOP   = duration of 0x1401C77C0
-PACE   = nested duration of 0x1401C6CB0
-RENDER = nested duration of 0x1401D72F0
-OTHER  = LOOP - PACE - RENDER
-```
+`PACE` stayed around `~0.001 ms/iteration` and is negligible.
 
-The probe completed with sane counts:
+## v0.2 resolves the WAIT ambiguity
 
-```text
-LOOP calls   = 29,590
-PACE calls   = 29,590
-RENDER calls = 29,588
-bad_end      = 0
-thread mismatch = 0
-```
-
-Two independent natural good→heavy transitions showed similar growth:
-
-```text
-transition A:
-LOOP   +4.116 ms
-RENDER +1.641 ms
-OTHER  +2.475 ms
-
-transition B:
-LOOP   +3.745 ms
-RENDER +2.007 ms
-OTHER  +1.738 ms
-```
-
-`PACE` remained around `~0.001 ms/iteration`.
-
-**FACT:** a real `~1.7–2.5 ms` portion of the heavy-state increase appears in `OTHER`, outside the broad rendergraph/present bucket and outside frame-clock bookkeeping.
-
-**FACT:** this is a phase-level localization result, not yet a root-cause function.
-
-## Broad RENDER bucket includes deliberate waiting
-
-Static inspection of `0x1401D72F0` identified a nested frame-time wait helper at:
+`NemoFramePhaseProbe v0.2` added a nested boundary around:
 
 ```text
 1.60.1.7s:0x14011F730
 ```
 
-The helper uses `Sleep()` followed by a short spin phase to reach the target frame time.
+This function is statically a `Sleep()` + spin-until-target timing helper.
 
-Therefore the v0.1 `RENDER` value mixes:
-
-- active render/present-side CPU work
-- deliberate frame-time wait
-
-The observed `+1.6–2.0 ms` RENDER delta cannot yet be attributed directly to renderer work.
-
-## Current experiment: separate WAIT from active render work
-
-`NemoFramePhaseProbe v0.2` adds the nested wait boundary and derives:
+Derived buckets:
 
 ```text
 RENDER_ACTIVE = RENDER - WAIT
@@ -214,13 +113,49 @@ OTHER         = LOOP - PACE - RENDER
 CPU_ACTIVE    = OTHER + RENDER_ACTIVE + PACE
 ```
 
-Decision logic:
+Instrumentation completed cleanly:
 
-- `WAIT` falls while `RENDER_ACTIVE` stays roughly flat -> extra CPU work is mainly elsewhere and consumes time previously available for pacing wait;
-- `RENDER_ACTIVE` also rises materially -> the regression budget is split between active render work and `OTHER`;
-- coarse buckets remain distributed/noisy -> use differential CPU stack sampling good vs heavy.
+```text
+LOOP   calls = 33,339
+PACE   calls = 33,339
+RENDER calls = 33,337
+WAIT   calls =  2,092
+bad_end = 0
+thread mismatch = 0
+```
 
-See [`runtime-phase-localization.md`](runtime-phase-localization.md).
+The WAIT helper is conditional and sparse rather than a once-per-frame global pacing gate.
+
+## Clean good-vs-heavy result
+
+Using ordinary gameplay windows, classifying good as `LOOP <= 17.0 ms` and heavy as `LOOP >= 19.0 ms`, weighted by loop-call count:
+
+```text
+             GOOD       HEAVY      DELTA
+LOOP         16.683 ms  20.358 ms  +3.675 ms
+RENDER_ACTIVE11.404 ms  13.507 ms  +2.103 ms
+OTHER         5.253 ms   6.840 ms  +1.586 ms
+WAIT          0.024 ms   0.009 ms  -0.015 ms / loop
+CPU_ACTIVE   16.659 ms  20.349 ms  +3.690 ms
+```
+
+**FACT:** measured WAIT does not explain the heavy-state slowdown.
+
+**FACT:** active render-side CPU work genuinely rises by about `+2.10 ms` in the aggregate comparison.
+
+**FACT:** residual non-render main-loop work also rises by about `+1.59 ms`.
+
+At this coarse resolution the measured delta is roughly **57% `RENDER_ACTIVE` / 43% `OTHER`**.
+
+Two separate natural episodes independently show the same direction. See [`runtime-phase-localization.md`](runtime-phase-localization.md).
+
+## Interpretation
+
+The regression is no longer consistent with one coarse wait/pacing bucket consuming the missing time.
+
+The missing CPU budget is distributed across active render work and other main-loop work at this resolution.
+
+A shared scene/state/cardinality driver may increase both buckets, so this is **not** proof of two separate bugs.
 
 ## Descriptor / root-binding architecture remains a confirmed component
 
@@ -247,41 +182,40 @@ direct _malloc_base calls:
 1.60 lifetime/free path:  0x140117400  (~3,828 static incoming edges)
 ```
 
-Among a conservative mapped caller set, `390 / 392` 1.60 `p3_alloc` callers have 1.58 counterparts using `_malloc_base`.
-
-This remains important architectural context, but the recent negatives show why **static prevalence alone is not enough**. Generic p3mem hooks/patches are not justified.
-
-## Important negative / demoted leads
-
-Do not promote these again without new evidence:
-
-- DirectStorage introduction — backend exists in both builds
-- six-shader tuple/profile collision — `0` conflicts in the measured audit
-- new SRW-lock candidate — traced to `-map_dump` / I/O-cache functionality
-- TAA/rendergraph growth — mainly history-image acquire/init path
-- several large KDOP/vegetation changes — editor/load/build paths
-- traffic-semaphore growth — animated collision-shape initialization
-- several model/unit/UI candidates — setup/configuration rather than steady-state gameplay
-- direct-cost theory for `0x14154AAB0`
-- repeat direct-call probing of `0x1413C1470` without new xrefs
-- direct-cost theory for `0x1408DC510`
+This remains important architectural context, but recent runtime negatives show why static prevalence alone is not enough. Generic p3mem hooks/patches are not justified.
 
 ## Current technical direction
-
-The project is no longer using:
-
-```text
-static ranking -> next attractive function -> runtime probe
-```
 
 Current workflow:
 
 ```text
 coarse runtime phase localization
-  -> good-vs-heavy differential stack/counter work inside the winning phase
+  -> subdivide measured active buckets
+  -> good-vs-heavy differential stack/counter work if still distributed
   -> map measured hotspot to the completed 1.58 ↔ 1.60 counterpart set
   -> patch only after the missing-ms budget is measured
 ```
+
+Immediate next work:
+
+1. split `RENDER_ACTIVE` inside `0x1401D72F0` around stable low-overhead boundaries;
+2. split `OTHER` inside `0x1401C77C0` into stable pre/post-render or equivalent subphases;
+3. use differential CPU stack sampling if the subphase split is still broad/noisy.
+
+## Important negative / demoted leads
+
+Do not promote these again without new evidence:
+
+- DirectStorage introduction
+- six-shader tuple/profile collision
+- map-dump/I/O SRW-lock branch
+- TAA history-init growth as sustained cause
+- editor/load KDOP/vegetation candidates
+- collision-init traffic semaphore candidate
+- setup/config/UI/unit/model candidates
+- direct-cost theory for `0x14154AAB0`
+- repeated direct-call probing of `0x1413C1470`
+- direct-cost theory for `0x1408DC510`
 
 ## Telemetry caveat
 
