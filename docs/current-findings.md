@@ -1,6 +1,6 @@
 # Current findings
 
-Updated: **2026-09-15**
+Updated: **2026-09-16**
 
 ## Scope
 
@@ -29,7 +29,6 @@ On the tested setup:
 - light scenes can hold roughly `16.67 ms / 60 FPS`
 - heavier scene compositions commonly reach roughly `19–25 ms`
 - the slower state can be sustained rather than a single hitch
-- background motion can feel like `start -> stop -> start -> stop`
 - severity strongly depends on scene composition
 - unload/ferry/teleport transitions can sometimes restore ~16.67 ms without restarting the game
 
@@ -37,33 +36,21 @@ The camera-switch observation remains subjective/unresolved and is not used as t
 
 ## Confirmed runtime constraints
 
-### Sustained slowdown is not primarily a wait/fence problem
+Earlier frame-pacing probes showed that the previously measured DXGI/fence wait gates are too small to explain the sustained slowdown by themselves.
 
-`NemoFramePacingProbe v0.3` showed that the tested DXGI frame-latency gate and fence waits are too small to explain the sustained slowdown.
-
-**FACT:** CPU-side render construction reaches submission/present too late.
-
-### Slow regions mainly contain more work
-
-A broad structural probe was too intrusive for absolute timing, but within that run slow active-gameplay regions showed approximately:
+A broad structural probe also showed that slow active-gameplay regions mainly contain **more work**, approximately:
 
 ```text
-draws                 +37.6%
+draws                  +37.6%
 resource copy activity +50.2%
 sampler copy activity  +46.3%
 root CBV calls          +37.3%
 root table calls        +38.2%
 ```
 
-Per-draw rates remained comparatively flat. This favors repeated per-item/per-draw/per-queue costs that scale with scene complexity rather than one isolated stall.
-
-### Simple instancing-volume metrics do not explain the slowdown
-
-Raw instancing bytes/chunks/clusters were dynamic but did not track frametime strongly enough to explain the problem by themselves.
+Per-draw rates remained comparatively flat. This favors costs that scale with active scene work rather than one isolated fixed stall.
 
 ## Whole-corpus 1.58 ↔ 1.60 diff is complete
-
-The investigation no longer relies on a descriptor-only static comparison.
 
 ```text
 1.58 function inventory: 66,820
@@ -77,48 +64,179 @@ strong anchored 1.58-only: 375
 ambiguous unmatched regions: 3,370
 ```
 
-Unmatched functions are deliberately not all classified as new/removed. See [`global-diff-summary.md`](global-diff-summary.md).
+See [`global-diff-summary.md`](global-diff-summary.md).
 
-## Strongest new steady-state static candidate
+## Runtime follow-up demoted the strongest isolated static candidates
 
-Very high-confidence `render_queue_set_t` copy/append counterpart:
+### `render_queue_set_t` copy helper
+
+Static pair:
 
 ```text
 1.58.1.4s:0x1413D5830   516 B
 1.60.1.7s:0x14154AAB0  1370 B
 ```
 
-Both perform the same broad role. The 1.60 implementation contains substantial p3mem-style ownership/refcount machinery absent from 1.58.
+The 1.60 helper contains substantial new p3mem-style ownership/refcount machinery and was initially the strongest steady-state static candidate.
 
-Decompiler-visible sites:
-
-```text
-1.58: LOCK 0 / UNLOCK 0
-1.60: LOCK 32 / UNLOCK 16
-```
-
-These are syntactic code sites, not executed-per-call counts.
-
-The helper is reached from a strongly conserved render-frame construction function:
+`NemoRenderQueueProbe v0.2` found only **14 direct calls across 24,798 rendered frames**:
 
 ```text
-1.58.1.4s:0x141213E40  7503 B
-1.60.1.7s:0x1413C1AE0  7503 B
-normalized similarity ≈ 0.980
-outgoing calls: 56 -> 56
+0x013C2A22 = 12
+0x013C3289 = 1
+0x013C329D = 1
+0x0145CF47 = 0
+0x0154E4C4 = 0
 ```
 
-The caller invokes the helper in a queue-set loop plus two additional calls outside the loop.
+**FACT:** the static delta is real.
 
-**FACT:** repeated frame logic is preserved while the 1.60 helper is materially heavier and ownership-aware.
+**FACT:** direct runtime activity is far too sparse to explain a sustained multi-millisecond-per-frame regression.
 
-**HYPOTHESIS:** this added per-copy work may contribute measurable CPU cost in complex scenes.
+**Decision:** strongly demote the direct-cost theory. Do not rescue it without new evidence.
 
-Runtime call rate, executed atomic/refcount path rate and aggregate cost remain unmeasured. This is not yet a confirmed root cause.
+### `r_proto` lazy queue-mask resolution boundary
 
-## Broad 1.60 `p3mem` allocator/scope migration
+Mapped pair:
 
-The global corpus shows a cross-cutting architecture change:
+```text
+1.58.1.4s:0x141213A20   869 B
+1.60.1.7s:0x1413C1470  1463 B
+```
+
+A whole-executable direct-call scan found no `E8 rel32` calls to the proposed 1.60 target. The harvested call graph also contains no incoming direct-call edge for that boundary.
+
+**Decision:** the proposed direct-call experiment is closed. Indirect/tail/inlined use is not ruled out, but a new runtime attempt requires new reachability evidence first.
+
+### `traffic_trajectory_t::update_neighbors_bits`
+
+Mapped pair:
+
+```text
+1.58.1.4s:0x140815880  500 B
+1.60.1.7s:0x1408DC510  774 B
+```
+
+Four direct callsites were validated. Runtime totals:
+
+```text
+total calls = 85
+ordinary gameplay calls ≈ 55
+shutdown/unload-adjacent burst = 30
+```
+
+The same run captured a clean natural transition:
+
+```text
+baseline weighted mean ≈ 16.775 ms/frame
+heavy weighted mean    ≈ 22.268 ms/frame
+sustained delta        ≈ +5.49 ms/frame
+```
+
+There was an approximately **42.17 s call-free interval centered on the heavy-state onset**.
+
+**Decision:** direct execution cost at this target cannot plausibly own the sustained frame budget. The later increase in call rate is more likely a symptom of a busier scene than the direct cause.
+
+## Current pivot: coarse main-loop phase localization
+
+The active runtime chain is now:
+
+```text
+0x1401C5280  outer loop owner
+    -> 0x1401C77C0  main-loop iteration
+          -> 0x1401C6CB0  frame-clock / duration bookkeeping
+          -> 0x1401D72F0  rendergraph / present coordinator
+```
+
+`NemoFramePhaseProbe v0.1` measures:
+
+```text
+LOOP   = duration of 0x1401C77C0
+PACE   = nested duration of 0x1401C6CB0
+RENDER = nested duration of 0x1401D72F0
+OTHER  = LOOP - PACE - RENDER
+```
+
+The probe completed with sane counts:
+
+```text
+LOOP calls   = 29,590
+PACE calls   = 29,590
+RENDER calls = 29,588
+bad_end      = 0
+thread mismatch = 0
+```
+
+Two independent natural good→heavy transitions showed similar growth:
+
+```text
+transition A:
+LOOP   +4.116 ms
+RENDER +1.641 ms
+OTHER  +2.475 ms
+
+transition B:
+LOOP   +3.745 ms
+RENDER +2.007 ms
+OTHER  +1.738 ms
+```
+
+`PACE` remained around `~0.001 ms/iteration`.
+
+**FACT:** a real `~1.7–2.5 ms` portion of the heavy-state increase appears in `OTHER`, outside the broad rendergraph/present bucket and outside frame-clock bookkeeping.
+
+**FACT:** this is a phase-level localization result, not yet a root-cause function.
+
+## Broad RENDER bucket includes deliberate waiting
+
+Static inspection of `0x1401D72F0` identified a nested frame-time wait helper at:
+
+```text
+1.60.1.7s:0x14011F730
+```
+
+The helper uses `Sleep()` followed by a short spin phase to reach the target frame time.
+
+Therefore the v0.1 `RENDER` value mixes:
+
+- active render/present-side CPU work
+- deliberate frame-time wait
+
+The observed `+1.6–2.0 ms` RENDER delta cannot yet be attributed directly to renderer work.
+
+## Current experiment: separate WAIT from active render work
+
+`NemoFramePhaseProbe v0.2` adds the nested wait boundary and derives:
+
+```text
+RENDER_ACTIVE = RENDER - WAIT
+OTHER         = LOOP - PACE - RENDER
+CPU_ACTIVE    = OTHER + RENDER_ACTIVE + PACE
+```
+
+Decision logic:
+
+- `WAIT` falls while `RENDER_ACTIVE` stays roughly flat -> extra CPU work is mainly elsewhere and consumes time previously available for pacing wait;
+- `RENDER_ACTIVE` also rises materially -> the regression budget is split between active render work and `OTHER`;
+- coarse buckets remain distributed/noisy -> use differential CPU stack sampling good vs heavy.
+
+See [`runtime-phase-localization.md`](runtime-phase-localization.md).
+
+## Descriptor / root-binding architecture remains a confirmed component
+
+The mapped 1.58 DX12 path derives root signatures and descriptor capacities from actual pipeline layout. The mapped 1.60 path selects one of 13 fixed shader/root-signature profiles with fixed capacities, separate root CBVs and split per-set tables.
+
+Runtime probing confirmed large fixed-capacity over-reservation. `NemoDX12SamplerAllocReuse` safely removed roughly **95%** of targeted sampler allocation/copy pressure with clean safety counters.
+
+The broader heavy-scene slowdown still occurs with that optimization active.
+
+**Conclusion:** descriptor/sampler work is a validated optimization component, not a complete explanation.
+
+See [`shader-profile-architecture-delta.md`](shader-profile-architecture-delta.md).
+
+## Broad 1.60 `p3mem` migration remains a structural fact
+
+The global corpus shows:
 
 ```text
 direct _malloc_base calls:
@@ -129,170 +247,42 @@ direct _malloc_base calls:
 1.60 lifetime/free path:  0x140117400  (~3,828 static incoming edges)
 ```
 
-Among a conservative mapped caller set, `390 / 392` functions using 1.60 `p3_alloc` have 1.58 counterparts using `_malloc_base`.
+Among a conservative mapped caller set, `390 / 392` 1.60 `p3_alloc` callers have 1.58 counterparts using `_malloc_base`.
 
-Decompiler-visible atomic/refcount signatures increase substantially in 1.60. The migration reaches both render construction and active traffic code.
-
-One active traffic example:
-
-```text
-traffic_trajectory_t::update_neighbors_bits
-1.58.1.4s:0x140815880  500 B
-1.60.1.7s:0x1408DC510  774 B
-```
-
-The 1.60 path adds scope-backed temporary storage/refcount cleanup.
-
-**Important:** static prevalence does not prove significant frametime cost. Do not patch global p3mem without runtime evidence.
-
-## Descriptor / root-binding architecture remains a confirmed component
-
-The mapped 1.58 DX12 path derives root signatures and descriptor capacities from the actual pipeline layout. The mapped 1.60 path selects one of 13 fixed shader/root-signature profiles with fixed capacities, separate root CBVs and split per-set tables.
-
-High-confidence chain:
-
-```text
-RFX shader profile
-  -> resource bucketization / cross-stage merge
-  -> 1.60.1.7s:0x14144C770
-  -> 1.60.1.7s:0x1402D7D70
-  -> 1.60.1.7s:0x1402942D0
-  -> descriptor update/build
-  -> 1.60.1.7s:0x14029E1F0
-  -> generalized root/table submission
-```
-
-Mapped counterparts include:
-
-```text
-1.60:0x1402D7D70 <-> 1.58:0x1401EB530
-1.60:0x1402E25A0 <-> 1.58:0x1401F4FB0
-1.60:0x14144C770 <-> 1.58:0x14129BF20
-1.60:0x1402942D0 <-> 1.58:0x1401AC780
-1.60:0x14029E1F0 <-> 1.58:0x1401B4800
-```
-
-See [`shader-profile-architecture-delta.md`](shader-profile-architecture-delta.md).
-
-## Fixed profile reservation is confirmed at runtime
-
-A broad structural probe showed median active-gameplay ratios around:
-
-```text
-reserved resource capacity / actual layout demand ~7.62x
-reserved sampler capacity  / actual sampler demand ~8.34x
-```
-
-Typical sampler values were roughly:
-
-```text
-reserved ~18.0 slots/draw
-actual   ~2.12 sampler bindings/draw
-```
-
-The `material` profile accounted for about 87% of active-gameplay draws in that capture.
-
-The probe itself was too intrusive for unbiased absolute timing.
-
-## Sampler allocation/copy pressure is real but not the complete cause
-
-`NemoDX12SamplerAllocReuse v0.2` observed:
-
-```text
-requested_slots_original  = 2,251,985,241
-allocated_slots_real      =    96,277,760
-avoided_slots             = 2,156,696,505
-sampler_copy_calls_seen   =   247,221,488
-copy_calls_skipped        =   235,147,658
-```
-
-Derived:
-
-```text
-~95.77% requested sampler slots avoided
-~95.12% sampler copy calls skipped
-```
-
-A later v0.3 run reproduced roughly `95.18%` avoided slots and `94.49%` skipped copies. Safety/error counters remained zero.
-
-**FACT:** the fixed-profile sampler path creates large, safely reducible pressure.
-
-**FACT:** the broader heavy-scene slowdown can still occur after that pressure is strongly reduced.
-
-Therefore sampler reuse is a validated optimization component, not a complete fix.
-
-## Other ranked global-diff candidates
-
-### `r_proto` lazy render-queue mask resolution
-
-Strong counterpart:
-
-```text
-1.58.1.4s:0x141213A20   869 B
-1.60.1.7s:0x1413C1470  1463 B
-```
-
-1.60 adds lazy resolution when the cached mask is `0xFFFFFFFF`, then caches the result. This makes it more plausible as a streaming/first-use component than a permanent every-frame cost.
-
-### DX12 resource allocator / TLSF / defragmentation
-
-1.60 contains additional DX12 resource-pool/TLSF/defragmentation code, including a `dx12_pool_t::defragment_data(...)` candidate around `1.60.1.7s:0x14028E320`.
-
-Steady-state activation/frequency is not established, so this remains lower priority.
+This remains important architectural context, but the recent negatives show why **static prevalence alone is not enough**. Generic p3mem hooks/patches are not justified.
 
 ## Important negative / demoted leads
 
 Do not promote these again without new evidence:
 
 - DirectStorage introduction — backend exists in both builds
-- six-shader tuple/profile collision — `0` conflicts in the measured runtime audit
+- six-shader tuple/profile collision — `0` conflicts in the measured audit
 - new SRW-lock candidate — traced to `-map_dump` / I/O-cache functionality
 - TAA/rendergraph growth — mainly history-image acquire/init path
 - several large KDOP/vegetation changes — editor/load/build paths
 - traffic-semaphore growth — animated collision-shape initialization
 - several model/unit/UI candidates — setup/configuration rather than steady-state gameplay
+- direct-cost theory for `0x14154AAB0`
+- repeat direct-call probing of `0x1413C1470` without new xrefs
+- direct-cost theory for `0x1408DC510`
 
-## Current technical model
+## Current technical direction
 
-The evidence fits a cumulative model better than a one-bug model:
-
-```text
-heavy scene / more active work
-  -> more repeated 1.60 CPU-side infrastructure work
-     - render_queue ownership/refcount
-     - descriptor/root-binding overhead
-     - possibly other active p3mem paths
-  -> CPU render construction reaches submit/present later
-
-world rebuild / unload / ferry
-  -> active scene/queue/scope state changes or is rebuilt
-  -> repeated work may drop
-  -> ~16.67 ms behavior can return without process restart
-```
-
-This is a hypothesis framework, not proof of causality.
-
-## Exact next runtime step
-
-Do not return to a broad D3D profiler.
-
-First probe target:
+The project is no longer using:
 
 ```text
-1.60.1.7s:0x14154AAB0
+static ranking -> next attractive function -> runtime probe
 ```
 
-Collect low-overhead synchronized counters during ordinary gameplay:
+Current workflow:
 
-1. helper calls/window
-2. queue-set count from the preserved caller if safe/read-only
-3. cheap count of ownership/refcount-heavy branch entries if identifiable
-4. natural unload/ferry/teleport transitions as context
-
-Only if counts/branch behavior correlate with good (~16.7 ms) versus sustained heavy (~20–25 ms) windows should aggregate or sampled timing be added.
-
-If the measured cost is negligible, demote this branch immediately and continue down the global ranking.
+```text
+coarse runtime phase localization
+  -> good-vs-heavy differential stack/counter work inside the winning phase
+  -> map measured hotspot to the completed 1.58 ↔ 1.60 counterpart set
+  -> patch only after the missing-ms budget is measured
+```
 
 ## Telemetry caveat
 
-`SCS frame_start` is not guaranteed to be 1:1 with physically rendered frames. Prefer actual rendered-frame timing, wall time, synchronized counters and narrow exact/aggregate duration measurements.
+`SCS frame_start` is not guaranteed to be 1:1 with physically rendered frames. Prefer actual rendered-frametime timing, wall time, synchronized counters and narrow aggregate duration measurements.
