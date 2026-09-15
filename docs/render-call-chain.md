@@ -1,46 +1,62 @@
 # Render / resource call chains
 
+Updated: **2026-09-16**
+
 Current working high-interest chains for ETS2 `1.60.1.7s`.
 
-The descriptor path below remains valid, but the completed whole-corpus diff identified an additional frame-level `render_queue_set_t` ownership/copy path that is now the first runtime-discriminator target.
+## Main-loop timing chain
+
+Current coarse runtime-localization chain:
+
+```text
+0x1401C5280  outer loop owner
+    ↓
+0x1401C77C0  main-loop iteration / LOOP
+    ├─> 0x1401C6CB0  frame-clock bookkeeping / PACE
+    └─> 0x1401D72F0  rendergraph-present coordinator / RENDER
+            └─> 0x14011F730  frame-time wait helper / WAIT
+```
+
+`NemoFramePhaseProbe v0.1` found that `PACE` is negligible while the heavy state consistently adds time to both `OTHER = LOOP - PACE - RENDER` and the broad `RENDER` bucket.
+
+Two natural transitions:
+
+```text
+transition A: LOOP +4.116 ms, RENDER +1.641 ms, OTHER +2.475 ms
+transition B: LOOP +3.745 ms, RENDER +2.007 ms, OTHER +1.738 ms
+```
+
+The nested `0x14011F730` wait helper uses `Sleep()` followed by a short spin phase, so `RENDER` is not pure active renderer work. The current v0.2 phase probe separates `WAIT` and derives `RENDER_ACTIVE = RENDER - WAIT`.
+
+See [`runtime-phase-localization.md`](runtime-phase-localization.md).
 
 ## Frame render / queue-set path
 
-Strong 1.58/1.60 caller counterpart:
+Strong 1.58/1.60 function counterpart:
 
 ```text
 1.58.1.4s:0x141213E40
 1.60.1.7s:0x1413C1AE0
 ```
 
-The two caller bodies are 7503 B in both builds with ~0.980 normalized similarity and 56 outgoing calls in both.
+The two bodies are 7503 B in both builds with ~0.980 normalized similarity and 56 outgoing calls in both.
 
-The path contains the same broad render-frame construction flow, including scene queues used for effects such as distortion/sunshaft/no-AA/deferred work.
+The path contains the same broad render-frame construction flow, including scene queues used for distortion/sunshaft/no-AA/deferred work.
 
-A preserved loop copies/appends queue-set entries:
-
-```text
-frame render construction
-  ↓
-iterate render_queue_set_t entries
-  ↓
-1.60.1.7s:0x14154AAB0  queue-set copy/append helper
-  ↓
-continue frame render construction
-```
-
-The corresponding helper is:
+A mapped queue-set copy/append helper is:
 
 ```text
 1.58.1.4s:0x1413D5830   516 B
 1.60.1.7s:0x14154AAB0  1370 B
 ```
 
-Both perform the same broad queue-set copy/append role. 1.60 adds substantial p3mem-style ownership/refcount machinery.
+The 1.60 implementation adds substantial p3mem-style ownership/refcount machinery.
 
-The caller invokes the corresponding helper once per queue-set element in the relevant path, plus two additional helper calls outside the loop.
+### Runtime correction
 
-Current status: strongest new steady-state static candidate; runtime call rate and cost are not yet measured.
+`NemoRenderQueueProbe v0.2` found only **14 direct executions across 24,798 rendered frames**.
+
+Current status: strong static regression-shaped delta, but the direct helper-cost theory is strongly demoted as an explanation for sustained multi-millisecond frame loss.
 
 ## `r_proto` lazy queue-mask resolution
 
@@ -53,7 +69,9 @@ Mapped pair:
 
 1.58 consumes the cached mask directly. 1.60 checks for unresolved sentinel `0xFFFFFFFF`, resolves additional state/type information, writes the mask back and then continues filtering.
 
-Because the result is cached, this path is currently treated as a likely first-use/streaming component rather than guaranteed steady-state overhead.
+The proposed exact 1.60 instrumentation boundary has no direct `E8 rel32` callsites and no incoming direct-call edge in the harvested graph.
+
+Current status: direct-call probe closed pending new indirect/tail/xref evidence.
 
 ## Descriptor / resource path
 
@@ -99,17 +117,19 @@ Semantic/resource resolver used during bundle construction. It resolves semantic
 
 `1.60.1.7s:0x1402942D0` builds descriptor/root-table update state, followed by `1.60.1.7s:0x14029E1F0` and generalized state/root-table/draw submission.
 
-Runtime experiments proved very large fixed-profile sampler reservation/copy redundancy and safely removed roughly 95% of targeted sampler allocation/copy pressure. The heavy-scene slowdown still occurs, so this chain remains relevant but is no longer treated as the complete explanation.
+Runtime experiments proved very large fixed-profile sampler reservation/copy redundancy and safely removed roughly 95% of targeted sampler allocation/copy pressure. The heavy-scene slowdown still occurs, so this chain remains relevant but is not treated as the complete explanation.
 
 ## Broader p3mem context
 
-The 1.60 global diff also maps a broad allocator/scope migration:
+The 1.60 global diff maps a broad allocator/scope migration:
 
 ```text
 1.60.1.7s:0x140117240  p3_alloc path
 1.60.1.7s:0x140117400  scope lifetime/free helper
 ```
 
-This infrastructure reaches both the frame queue-copy helper and active traffic code.
+This infrastructure reaches both rendering and active traffic code.
+
+A path-specific traffic test at `0x1408DC510` proved too sparse to explain sustained per-frame cost. Generic p3mem helpers therefore remain architectural context, not justified global hook/patch targets.
 
 Do not hook these generic helpers globally for performance measurement; their fan-in is too large and observer effect would be difficult to control.
