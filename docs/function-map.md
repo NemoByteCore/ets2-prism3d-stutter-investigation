@@ -4,19 +4,47 @@ This page tracks current working identifications for high-interest Prism3D funct
 
 Working names are research labels unless explicitly stated otherwise.
 
-## Highest-priority 1.60.1.7s candidates after the global diff
+## Current 1.60.1.7s runtime-localization map
 
-| Address | Working name | Confidence | Why it matters |
+| Address | Working name | Confidence | Current status |
 |---|---|---|---|
-| `0x14154AAB0` | `render_queue_set_t` copy / append helper | High | Strong 1.58 counterpart; called repeatedly from a conserved frame-render construction path; 1.60 adds substantial p3mem-style ownership/refcount machinery. Current top runtime-discriminator target. |
-| `0x1413C1AE0` | render-frame construction caller | High | Strong counterpart to `1.58:0x141213E40`; 7503 B in both builds, ~0.980 normalized similarity, 56 outgoing calls in both; loops over queue sets and calls `0x14154AAB0`, plus two additional copies. |
-| `0x1413C1470` | render-queue / `r_proto` mask filter with lazy resolution | High | Counterpart to `1.58:0x141213A20`; 1.60 resolves sentinel `0xFFFFFFFF`, caches the result, then continues filtering. Likely first-use/streaming-sensitive. |
-| `0x140117240` | recovered `p3mem_scope_t::p3_alloc(...)` path | High | Central 1.60 allocator/scope path with ~1,485 static incoming edges; part of the broad 1.60 p3mem migration. |
-| `0x140117400` | p3mem scope lifetime/free helper | Medium/High | ~3,828 static incoming edges; participates in scope ownership/refcount cleanup. Do not hook globally for performance measurement. |
-| `0x1408DC510` | `traffic_trajectory_t::update_neighbors_bits` | High | Active traffic path; counterpart to `1.58:0x140815880`; 1.60 gains p3mem scope-backed temporary storage/refcount work. |
-| `0x14028E320` | `dx12_pool_t::defragment_data(...)` candidate | Medium/High | 1.60 DX12 resource allocator/TLSF/defrag path; steady-state activation/frequency unknown. |
+| `0x1401C5280` | outer main-loop owner | Medium/High | Calls the measured main-loop iteration boundary. Current coarse runtime-localization anchor. |
+| `0x1401C77C0` | main-loop iteration | High | `NemoFramePhaseProbe` LOOP boundary; tracks the sustained heavy-state increase. |
+| `0x1401C6CB0` | frame-clock / duration bookkeeping | Medium/High | PACE boundary; measured at ~0.001 ms/iteration and effectively ruled out as the regression owner. |
+| `0x1401D72F0` | rendergraph / present coordinator | Medium/High | Broad RENDER boundary. Contains both active work and a nested deliberate frame-time wait. |
+| `0x14011F730` | frame-time wait helper | Medium/High | Uses `Sleep()` followed by a short spin phase; separated in `NemoFramePhaseProbe v0.2`. |
+| `0x14154AAB0` | `render_queue_set_t` copy / append helper | High | Strong static 1.58 counterpart, but only 14 direct runtime calls across 24,798 rendered frames. Direct-cost theory strongly demoted. |
+| `0x1413C1AE0` | render-frame construction function | High | Strong 1.58 counterpart. Important static context, but not treated as a per-frame timing boundary after the direct helper-frequency result. |
+| `0x1413C1470` | render-queue / `r_proto` mask filter with lazy resolution | High | No direct `E8` callsites / incoming direct-call edge for the proposed hook boundary. Direct-call experiment closed pending new reachability evidence. |
+| `0x140117240` | recovered `p3mem_scope_t::p3_alloc(...)` path | High | Central 1.60 allocator/scope path with ~1,485 static incoming edges. Structural context only; do not hook globally. |
+| `0x140117400` | p3mem scope lifetime/free helper | Medium/High | ~3,828 static incoming edges. Structural context only; do not hook globally. |
+| `0x1408DC510` | `traffic_trajectory_t::update_neighbors_bits` | High | Active traffic path, but only 85 total calls in the measured run and absent for ~42 s around a natural heavy-state onset. Direct-cost theory strongly demoted. |
+| `0x14028E320` | `dx12_pool_t::defragment_data(...)` candidate | Medium/High | 1.60 DX12 resource allocator/TLSF/defrag path; steady-state activation/frequency still unproven. |
 
-### New render-queue counterpart set
+## Main-loop phase-localization chain
+
+```text
+0x1401C5280  outer loop owner
+    -> 0x1401C77C0  LOOP
+          -> 0x1401C6CB0  PACE / frame-clock bookkeeping
+          -> 0x1401D72F0  RENDER / rendergraph-present coordinator
+                -> 0x14011F730  WAIT / frame-time wait helper
+```
+
+`NemoFramePhaseProbe v0.1` found two similar natural good→heavy transitions:
+
+```text
+transition A: LOOP +4.116 ms, RENDER +1.641 ms, OTHER +2.475 ms
+transition B: LOOP +3.745 ms, RENDER +2.007 ms, OTHER +1.738 ms
+```
+
+`PACE` stayed around `~0.001 ms/iteration`.
+
+Because `RENDER` includes the nested wait helper, `NemoFramePhaseProbe v0.2` separates `WAIT` and derives `RENDER_ACTIVE = RENDER - WAIT`.
+
+See [`runtime-phase-localization.md`](runtime-phase-localization.md).
+
+## Render-queue counterpart set
 
 ```text
 1.58.1.4s:0x1413D5830   516 B
@@ -34,18 +62,18 @@ Decompiler-visible sites:
 
 These are code sites, **not** executed-per-call counts.
 
-The corresponding frame caller is:
+The corresponding frame-construction function is:
 
 ```text
 1.58.1.4s:0x141213E40  7503 B
 1.60.1.7s:0x1413C1AE0  7503 B
 ```
 
-The preserved loop invokes the helper once per queue-set element in the relevant path, plus two additional helper calls outside the loop.
+Static mapping remains high confidence, but runtime measurement found only 14 direct helper calls across 24,798 rendered frames.
 
-Current status: very strong static regression-shaped candidate; runtime cost unmeasured.
+Current status: **strong static delta, strongly demoted sustained direct-cost theory**.
 
-### `r_proto` lazy-resolution counterpart
+## `r_proto` lazy-resolution counterpart
 
 ```text
 1.58.1.4s:0x141213A20   869 B
@@ -54,9 +82,9 @@ Current status: very strong static regression-shaped candidate; runtime cost unm
 
 1.58 consumes the cached render-queue mask directly. 1.60 checks for sentinel `0xFFFFFFFF`; when unresolved, it follows additional state, resolves the mask/type, stores the result back and performs ownership cleanup before continuing.
 
-Because the result is cached, this is currently ranked as a likely first-use/streaming component rather than a guaranteed every-frame cost.
+The proposed exact 1.60 boundary has no direct `E8` callsites and no incoming direct-call edge in the harvested graph. That does not disprove indirect/tail/inlined use, but direct-call probing is not repeated without new xref evidence.
 
-### Active traffic p3mem counterpart
+## Active traffic p3mem counterpart
 
 ```text
 1.58.1.4s:0x140815880  500 B
@@ -65,7 +93,9 @@ Because the result is cached, this is currently ranked as a likely first-use/str
 
 Recovered context identifies this family as `traffic_trajectory_t::update_neighbors_bits`. The 1.60 version adds thread-local p3mem scope acquisition/refcount and scope-backed temporary storage.
 
-This demonstrates that the p3mem migration reaches active gameplay code; it does not by itself prove material runtime cost.
+Runtime follow-up found only 85 total executions in the full run, with 30 in a final shutdown/unload-adjacent burst. A natural heavy-state onset occurred across an approximately 42 s call-free interval.
+
+Current status: **proves p3mem reaches active gameplay code; does not support this function as a sustained direct-cost root cause**.
 
 ## Existing 1.60 descriptor / rendering chain
 
@@ -80,7 +110,7 @@ This demonstrates that the p3mem migration reaches active gameplay code; it does
 | `0x14028EBE0` | shader-visible descriptor heap setup | High | Initializes resource heap capacity `0x80000` and sampler heap capacity `0x800`. |
 | `0x14144CE50` | `uniform_builder_t` array lookup helper | High | 1.60 out-of-line lookup; equivalent work is inline in mapped 1.58 code. |
 | `0x14144C160` | composite `uniform_builder_t` merge helper | Medium/High | Combines differing builders while merging/deduplicating callback entries. |
-| `0x1402E4D50` | shader-pipeline cache/create path with profile state | Medium/High | Runtime audit observed 0 tuple/profile conflicts in the measured run; collision hypothesis is lower priority. |
+| `0x1402E4D50` | shader-pipeline cache/create path with profile state | Medium/High | Runtime audit observed 0 tuple/profile conflicts in the measured run. |
 | `0x140292620` | pipeline-state lookup/task path | Medium/High | Larger 1.60 path capable of queueing pipeline compile tasks; runtime significance not established. |
 | `0x14022E380` | material lookup helper | High | Small array helper; not considered a primary bottleneck. |
 | `0x1401DB850` | `pp_batch_data_t` index/helper | High | Small array helper; not considered a primary bottleneck. |
@@ -113,7 +143,7 @@ r_resource_bundle_t
 |---|---|---|---|
 | `0x1401EB530` | `0x1402D7D70` | Recovered symbol/type/assert context and near-identical normalized structure. | High |
 | `0x1401F4FB0` | `0x1402E25A0` | Exact 342-byte size and effectively identical resource packet scan algorithm after normalization. | High |
-| `0x14129BF20` | `0x14144C770` | Exact 421-byte size and effectively identical context/cache-key algorithm. | High |
+| `0x14129BF20` | `0x14144C770` | Exact 421-byte size and effectively identical context/cache-key algorithm after normalization. | High |
 | `0x1401AC780` | `0x1402942D0` | Same recovered descriptor-update role and type fingerprint. | High |
 | `0x1401B4800` | `0x14029E1F0` | Same unique draw diagnostic/context and downstream role. | High |
 | `0x14014D570` | `0x14022E380` | Exact 90-byte `r_material_t` array helper. | High |
@@ -124,6 +154,8 @@ r_resource_bundle_t
 The completed whole-corpus pass recovered **58,589 confirmed counterpart pairs** across the two builds. The initial structural skeleton was used only to constrain search space; it was not treated as semantic proof after a concrete false-pair case was found.
 
 Final high-confidence recovery uses normalized pseudocode, distinctive strings/types, validated callgraph continuity and uniqueness/margin checks.
+
+The recent runtime negatives do not invalidate the counterpart map; they change how it is used. The map now follows runtime localization instead of driving isolated target selection by static size/novelty alone.
 
 See [`global-diff-summary.md`](global-diff-summary.md).
 
