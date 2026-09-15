@@ -1,32 +1,27 @@
 # 1.58 → 1.60 shader-profile / resource-layout architecture delta
 
-This page documents a static architecture change found while comparing ETS2 1.58.1.4s with 1.60.1.7s.
-
-The goal is not to claim a root cause prematurely, but to record the strongest regression-shaped structural delta found so far.
+> **Scope update — 2026-09-15:** this document describes a high-confidence **local rendering-branch delta**. A later hypothesis-agnostic whole-corpus diff found additional cross-cutting 1.60 changes, especially p3mem ownership/scope machinery. The descriptor/root-binding branch remains real and runtime-relevant, but it is no longer treated as the complete or automatically dominant root-cause theory. See [`global-diff-summary.md`](global-diff-summary.md).
 
 ## Summary
 
-The 1.60 rendering path introduces a broader shader-profile/resource-layout model that is not present in the mapped 1.58 flow.
+The mapped 1.60 rendering path introduces a shader-profile/resource-layout model that differs materially from the mapped 1.58 flow.
 
 ```text
-RFX pass
-  ↓
-shader profile
-  ↓
-resource bucketization
-  ↓
-cross-stage layout merge
-  ↓
-expanded uniform-builder representation
-  ↓
-profiled DX12 root signature
-  ↓
-generalized descriptor/root-table mapping
-  ↓
-draw submission
+1.58:
+actual pipeline layout
+→ layout-specific root signature
+→ layout-specific descriptor capacities
+→ compact resource + sampler table model
+
+1.60:
+RFX shader profile
+→ one of 13 fixed root-signature profiles
+→ fixed profile descriptor capacities
+→ individual root CBVs + split per-set tables
+→ generalized root-parameter submission
 ```
 
-The profile table has now been extracted and decoded. This makes the 1.58/1.60 contrast more concrete: 1.58 derives a root signature from the actual pipeline layout, whereas 1.60 selects one of 13 fixed root-signature profiles.
+This is a confirmed architectural difference in the mapped branch. Runtime experiments also confirmed that fixed profile sampler reservation/copy pressure is very large. However, removing roughly 95% of targeted sampler allocation/copy work does not eliminate the broader heavy-scene slowdown.
 
 ## Exact 1.60 profile IDs
 
@@ -50,9 +45,7 @@ The static name table is at `1.60.1.7s:0x141D00BD0`; the root-profile descriptor
 
 ## Profile descriptor format
 
-`1.60.1.7s:0x140293700` consumes 5-byte profile entries.
-
-Current decode:
+`1.60.1.7s:0x140293700` consumes 5-byte entries:
 
 ```text
 byte 0: kind
@@ -71,11 +64,11 @@ byte 3: CBV shader register for kind 0
 byte 4: descriptor count for table kinds
 ```
 
-The one observed `0xFF` count is the pixel SRV range in `lightpass`; it is serialized as an unbounded range while the internal per-draw bookkeeping uses 16 as its working count.
+The observed `0xFF` count in the `lightpass` pixel-SRV range is serialized as an unbounded range while internal per-draw bookkeeping uses 16 as its working count.
 
 ## Profile capacities
 
-| Profile | Root params | Root CBVs | Resource slots | Sampler slots | Table root params |
+| Profile | Root params | Root CBVs | Resource slots | Sampler slots | Table roots |
 |---|---:|---:|---:|---:|---:|
 | compute | 5 | 2 | 18 | 8 | 3 |
 | fullscreen | 8 | 4 | 24 | 16 | 4 |
@@ -91,34 +84,37 @@ The one observed `0xFF` count is the pixel SRV range in `lightpass`; it is seria
 | shadow | 4 | 1 | 5 | 1 | 3 |
 | sky | 5 | 3 | 8 | 8 | 2 |
 
-`material`, `lightpass`, and `fullscreen` are the most expanded common graphics profiles in this table.
+## Fixed profile capacity drives 1.60 descriptor reservation
 
-## 1.60 uses fixed profile capacity during descriptor allocation
+`1.60.1.7s:0x1402942D0` resolves the selected profile through pipeline state and uses profile totals when reserving resource and sampler descriptor spans via `1.60.1.7s:0x14028F070`.
 
-`1.60.1.7s:0x1402942D0` resolves the selected profile through `r_shader_pipeline_t + 0x8A`, then uses the profile root-signature totals when reserving resource and sampler descriptor-heap slots.
+For example, the `material` profile carries capacity for 20 resource descriptors and 20 sampler descriptors.
 
-The descriptor-heap allocator is `1.60.1.7s:0x14028F070`.
+This does **not** mean every reserved slot is written every draw.
 
-Therefore the reservation size is profile-capacity driven. For example, the `material` profile carries capacity for 20 resource descriptors and 20 sampler descriptors.
+Runtime structural measurement found median active-gameplay ratios of roughly:
 
-This does **not** mean every reserved slot is necessarily written every draw. That distinction needs runtime measurement.
+```text
+reserved resource capacity / actual layout demand ~7.62x
+reserved sampler capacity  / actual sampler demand ~8.34x
+```
 
-## The mapped 1.58 model was layout-specific
+Typical sampler values were roughly `18.0 reserved slots/draw` versus `2.12 actual sampler bindings/draw`.
 
-`1.58.1.4s:0x1401ABC10` lazily builds a DX12 root signature from the actual `r_shader_pipeline_layout_t`.
+## Mapped 1.58 model
+
+`1.58.1.4s:0x1401ABC10` lazily builds a DX12 root signature from the actual pipeline layout.
 
 The mapped 1.58 path derives descriptor ranges from real resource bindings and aggregates them into a compact model:
 
 ```text
-CBV/SRV/UAV ranges -> one resource descriptor table
-sampler ranges     -> one sampler descriptor table
+CBV/SRV/UAV ranges -> resource descriptor table
+sampler ranges     -> sampler descriptor table
 ```
 
-The mapped 1.58 descriptor builder (`0x1401AC780`) uses those layout-specific root-signature counts when reserving descriptor heap space.
+The mapped 1.58 descriptor builder (`1.58.1.4s:0x1401AC780`) reserves layout-specific counts. The allocator maps closely to `1.60.1.7s:0x14028F070`; the important difference is where requested counts come from.
 
-The allocator itself maps closely to the 1.60 allocator (`1.58:0x1401A6A20` ↔ `1.60:0x14028F070`), so the important difference is where the requested counts come from.
-
-## Root binding also changed architecture
+## Root binding architecture also changed
 
 Mapped draw submission:
 
@@ -129,69 +125,45 @@ Mapped draw submission:
 
 The mapped 1.58 path conditionally binds a compact resource table and sampler table.
 
-The 1.60 path instead:
+The 1.60 path can instead:
 
-- selects one of 13 fixed profile root signatures,
-- uses root CBVs as separate root parameters,
-- tracks/caches multiple root-parameter values,
-- iterates per-set descriptor-table metadata,
-- handles SRV/UAV/sampler tables independently,
-- conditionally binds the resulting table handles.
+- select a fixed profile root signature
+- use individual root CBVs
+- track multiple cached root-parameter values
+- iterate per-set descriptor-table metadata
+- handle SRV/UAV/sampler tables independently
+- bind multiple table roots
 
-Common 1.60 profiles such as `material`, `fullscreen`, and `lightpass` contain four descriptor-table root parameters, plus multiple root CBVs.
+## Runtime result: sampler pressure is real and reducible
 
-## Current interpretation
+`NemoDX12SamplerAllocReuse` safely avoids roughly 95% of targeted sampler allocation/copy pressure in ordinary-play runs with safety counters remaining zero.
 
-The strongest static regression-shaped change is now more specific than “larger descriptor structures”:
+This validates the descriptor/sampler branch as a real optimization target.
 
-```text
-1.58:
-actual pipeline layout
-→ layout-specific root signature
-→ exact descriptor capacities
-→ compact resource/sampler table model
+**Important:** sustained heavy-scene slowdown still occurs with that optimization active. Therefore this branch is a component, not a complete explanation.
 
-1.60:
-RFX shader profile
-→ fixed root-signature profile
-→ fixed profile descriptor capacities
-→ root CBVs + split per-set tables
-→ generalized root-parameter submission
-```
+## Pipeline tuple/profile audit
 
-This creates two concrete runtime questions:
-
-1. how much descriptor capacity is reserved but not actually written for typical draws,
-2. how much additional root-CBV/table checking and binding occurs for the common profiles.
-
-The previously observed ~95–96% redundant sampler descriptor copies make this branch especially worth measuring, but static evidence alone does not prove causality.
-
-## Pipeline-cache/profile identity remains an open audit
-
-The mapped 1.60 pipeline-cache/create function `0x1402E4D50` derives its pre-lookup identity from six shader identities, while the selected profile ID is stored on the created pipeline and later controls root-signature selection.
-
-A cache hit returns before an explicit requested-profile comparison is visible in this function.
-
-This is **not a confirmed bug**. The asset/data model may guarantee that one six-shader tuple can only occur with one profile.
-
-The clean test is a runtime audit of:
+A runtime audit observed:
 
 ```text
-six-shader tuple -> observed profile ID
+tuple requests          524
+unique shader tuples    377
+same-profile repeats    147
+tuple/profile conflicts 0
 ```
 
-and to report only tuples observed with more than one profile.
+This is negative evidence against the proposed practical six-shader-tuple/profile collision in the measured run. It does not prove the invariant globally, but the hypothesis is lower priority.
 
-## Next measurement
+## Current place in the investigation
 
-The next probe should be profile-aware rather than global. Useful counters include:
+The completed global diff now ranks the following above or alongside this local branch:
 
-- draw count by profile ID,
-- resource/sampler descriptor slots reserved by profile,
-- actual descriptor writes/copies,
-- root-CBV checks and actual root-CBV set calls,
-- descriptor-table checks and actual binds,
-- root-signature/profile switches,
-- conflicting shader-tuple/profile observations.
+1. repeated `render_queue_set_t` ownership/refcount delta in a conserved frame-render path
+2. broader p3mem migration in active runtime paths
+3. this shader-profile / descriptor / root-binding architecture
+4. `r_proto` lazy mask resolution as a possible streaming/state component
 
-No behavior patch should be attempted until those rates are known.
+The next runtime experiment is therefore **not** another broad profile-aware D3D probe. It is a narrow counter/timing discriminator around `1.60.1.7s:0x14154AAB0`.
+
+Static evidence and runtime structural ratios should continue to be reported separately from causal claims.
