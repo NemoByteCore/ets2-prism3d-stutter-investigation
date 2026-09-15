@@ -20,156 +20,185 @@ ETS2:      1.58.1.4s
 SHA-256:   AB9785331BF9970542C61A0108A4E677C9F7C00FD316D4C0F9AB116F6BE6C234
 ```
 
-**1.58.1.4s is not run.**
+**1.58.1.4s is never run.**
 
-Primary symptom on the tested setup:
+## Primary runtime symptoms
 
-- light scenes can hold roughly ~16.67 ms / ~60 FPS
-- heavier scene compositions commonly reach ~19–25 ms
+On the tested setup:
+
+- light scenes can hold roughly `16.67 ms / 60 FPS`
+- heavier scene compositions commonly reach roughly `19–25 ms`
+- the slower state can be sustained rather than a single hitch
 - background motion can feel like `start -> stop -> start -> stop`
-- severity depends on scene composition
+- severity strongly depends on scene composition
 - unload/ferry/teleport transitions can sometimes restore ~16.67 ms without restarting the game
 
-## Confirmed runtime findings
+The camera-switch observation remains subjective/unresolved and is not used as the primary theory.
+
+## Confirmed runtime constraints
 
 ### Sustained slowdown is not primarily a wait/fence problem
 
-`NemoFramePacingProbe v0.3` showed that in slower scenes the DXGI frame-latency gate and the tested fence waits are not consuming enough time to explain the sustained slowdown.
+`NemoFramePacingProbe v0.3` showed that the tested DXGI frame-latency gate and fence waits are too small to explain the sustained slowdown.
 
-**FACT:** the CPU/render construction path reaches submission/present too late. The interesting work is earlier in the frame.
+**FACT:** CPU-side render construction reaches submission/present too late.
 
-### The slowdown is scene-dependent
+### Slow regions mainly contain more work
 
-Changing loaded scene state can move the same running game between a slower ~19–25 ms state and ~16.67 ms behavior.
-
-### Simple instancing-volume metrics do not explain it
-
-`NemoInstanceStateProbe` showed highly dynamic instancing activity, but raw bytes/chunks/clusters did not track frametime strongly enough to explain the slowdown by themselves.
-
-## 1.60 shader-profile architecture is materially different from 1.58
-
-High-confidence mapped chain in 1.60:
+A broad structural probe was too intrusive for absolute timing, but within that run slow active-gameplay regions showed approximately:
 
 ```text
-RFX pass / shader profile
-  -> resource bucketization + cross-stage merge
-  -> composite uniform-builder merge when needed
-  -> r_item
+draws                 +37.6%
+resource copy activity +50.2%
+sampler copy activity  +46.3%
+root CBV calls          +37.3%
+root table calls        +38.2%
+```
+
+Per-draw rates remained comparatively flat. This favors repeated per-item/per-draw/per-queue costs that scale with scene complexity rather than one isolated stall.
+
+### Simple instancing-volume metrics do not explain the slowdown
+
+Raw instancing bytes/chunks/clusters were dynamic but did not track frametime strongly enough to explain the problem by themselves.
+
+## Whole-corpus 1.58 ↔ 1.60 diff is complete
+
+The investigation no longer relies on a descriptor-only static comparison.
+
+```text
+1.58 function inventory: 66,820
+1.60 function inventory: 68,834
+confirmed counterpart pairs: 58,589
+coverage of 1.58: 87.68%
+coverage of 1.60: 85.12%
+materially changed confirmed pairs: 9,308
+strong anchored 1.60-only: 597
+strong anchored 1.58-only: 375
+ambiguous unmatched regions: 3,370
+```
+
+Unmatched functions are deliberately not all classified as new/removed. See [`global-diff-summary.md`](global-diff-summary.md).
+
+## Strongest new steady-state static candidate
+
+Very high-confidence `render_queue_set_t` copy/append counterpart:
+
+```text
+1.58.1.4s:0x1413D5830   516 B
+1.60.1.7s:0x14154AAB0  1370 B
+```
+
+Both perform the same broad role. The 1.60 implementation contains substantial p3mem-style ownership/refcount machinery absent from 1.58.
+
+Decompiler-visible sites:
+
+```text
+1.58: LOCK 0 / UNLOCK 0
+1.60: LOCK 32 / UNLOCK 16
+```
+
+These are syntactic code sites, not executed-per-call counts.
+
+The helper is reached from a strongly conserved render-frame construction function:
+
+```text
+1.58.1.4s:0x141213E40  7503 B
+1.60.1.7s:0x1413C1AE0  7503 B
+normalized similarity ≈ 0.980
+outgoing calls: 56 -> 56
+```
+
+The caller invokes the helper in a queue-set loop plus two additional calls outside the loop.
+
+**FACT:** repeated frame logic is preserved while the 1.60 helper is materially heavier and ownership-aware.
+
+**HYPOTHESIS:** this added per-copy work may contribute measurable CPU cost in complex scenes.
+
+Runtime call rate, executed atomic/refcount path rate and aggregate cost remain unmeasured. This is not yet a confirmed root cause.
+
+## Broad 1.60 `p3mem` allocator/scope migration
+
+The global corpus shows a cross-cutting architecture change:
+
+```text
+direct _malloc_base calls:
+1.58: 4,212
+1.60:   260
+
+1.60 p3_alloc path:       0x140117240  (~1,485 static incoming edges)
+1.60 lifetime/free path:  0x140117400  (~3,828 static incoming edges)
+```
+
+Among a conservative mapped caller set, `390 / 392` functions using 1.60 `p3_alloc` have 1.58 counterparts using `_malloc_base`.
+
+Decompiler-visible atomic/refcount signatures increase substantially in 1.60. The migration reaches both render construction and active traffic code.
+
+One active traffic example:
+
+```text
+traffic_trajectory_t::update_neighbors_bits
+1.58.1.4s:0x140815880  500 B
+1.60.1.7s:0x1408DC510  774 B
+```
+
+The 1.60 path adds scope-backed temporary storage/refcount cleanup.
+
+**Important:** static prevalence does not prove significant frametime cost. Do not patch global p3mem without runtime evidence.
+
+## Descriptor / root-binding architecture remains a confirmed component
+
+The mapped 1.58 DX12 path derives root signatures and descriptor capacities from the actual pipeline layout. The mapped 1.60 path selects one of 13 fixed shader/root-signature profiles with fixed capacities, separate root CBVs and split per-set tables.
+
+High-confidence chain:
+
+```text
+RFX shader profile
+  -> resource bucketization / cross-stage merge
   -> 1.60.1.7s:0x14144C770
   -> 1.60.1.7s:0x1402D7D70
-  -> r_resource_bundle_t
   -> 1.60.1.7s:0x1402942D0
-  -> DX12 descriptor update/build
+  -> descriptor update/build
   -> 1.60.1.7s:0x14029E1F0
-  -> generalized root-parameter submission
+  -> generalized root/table submission
 ```
 
-Important mapped counterparts:
+Mapped counterparts include:
 
 ```text
-1.60.1.7s:0x1402D7D70  <->  1.58.1.4s:0x1401EB530
-1.60.1.7s:0x1402E25A0  <->  1.58.1.4s:0x1401F4FB0
-1.60.1.7s:0x14144C770  <->  1.58.1.4s:0x14129BF20
-1.60.1.7s:0x1402942D0  <->  1.58.1.4s:0x1401AC780
-1.60.1.7s:0x14029E1F0  <->  1.58.1.4s:0x1401B4800
+1.60:0x1402D7D70 <-> 1.58:0x1401EB530
+1.60:0x1402E25A0 <-> 1.58:0x1401F4FB0
+1.60:0x14144C770 <-> 1.58:0x14129BF20
+1.60:0x1402942D0 <-> 1.58:0x1401AC780
+1.60:0x14029E1F0 <-> 1.58:0x1401B4800
 ```
-
-The mapped 1.58 DX12 path builds a root signature from the actual pipeline layout. 1.60 instead selects one of **13 fixed DX12 root-signature profiles**.
-
-```text
-1.58:
-actual layout
--> layout-specific root signature
--> layout-specific descriptor capacities
--> compact resource table + sampler table
-
-1.60:
-RFX shader profile
--> fixed root-signature profile
--> fixed descriptor capacities
--> individual root CBVs
--> split SRV/UAV/sampler tables by set/visibility
--> generalized root-parameter submission
-```
-
-Exact 1.60 profile names:
-
-```text
-0  compute
-1  fullscreen
-2  simple0
-3  simple1
-4  simple2
-5  simple3
-6  simple4
-7  simple1_shared
-8  lightpass
-9  material
-10 material_lite
-11 shadow
-12 sky
-```
-
-Selected fixed capacities:
-
-| Profile | Root params | Root CBVs | Resource slots | Sampler slots | Table roots |
-|---|---:|---:|---:|---:|---:|
-| `material` | 11 | 7 | 20 | 20 | 4 |
-| `lightpass` | 8 | 4 | 24 | 18 | 4 |
-| `fullscreen` | 8 | 4 | 24 | 16 | 4 |
-| `material_lite` | 6 | 4 | 6 | 6 | 2 |
 
 See [`shader-profile-architecture-delta.md`](shader-profile-architecture-delta.md).
 
-## Fixed profile reservation is now confirmed at runtime
+## Fixed profile reservation is confirmed at runtime
 
-`1.60.1.7s:0x1402942D0` passes fixed root-profile totals to the descriptor allocator. A broad structural runtime probe showed that, in active gameplay, fixed capacity is much larger than actual layout demand.
-
-Median active-frame ratios from that run:
+A broad structural probe showed median active-gameplay ratios around:
 
 ```text
-reserved resource capacity / actual resource-layout demand ~7.62x
-reserved sampler capacity  / actual sampler demand         ~8.34x
+reserved resource capacity / actual layout demand ~7.62x
+reserved sampler capacity  / actual sampler demand ~8.34x
 ```
 
-Typical per-draw sampler values were roughly:
+Typical sampler values were roughly:
 
 ```text
-reserved sampler slots ~18.0/draw
-actual sampler bindings ~2.12/draw
+reserved ~18.0 slots/draw
+actual   ~2.12 sampler bindings/draw
 ```
 
-The `material` profile accounted for about 87% of active gameplay draws in that capture.
+The `material` profile accounted for about 87% of active-gameplay draws in that capture.
 
-The probe itself was too intrusive for absolute frametime attribution, but these structural ratios are useful.
+The probe itself was too intrusive for unbiased absolute timing.
 
-## Sampler heap pressure is a real optimization target
+## Sampler allocation/copy pressure is real but not the complete cause
 
-Static allocator reconstruction shows:
-
-```text
-1.60.1.7s:0x14028F070  descriptor allocation / cursor advance
-sampler heap capacity   0x800 = 2,048 descriptors
-resource heap capacity  0x80000 = 524,288 descriptors
-```
-
-The fixed profile sampler spans therefore matter much more for heap pressure than the same style of over-reservation on the much larger resource heap.
-
-### Earlier copy-only result
-
-`NemoDX12SamplerReuse v0.4` safely skipped roughly 95–96% of targeted sampler descriptor copies, but deliberately left Prism's original sampler allocations untouched. The user reported a small subjective improvement.
-
-### Allocator-side reuse result
-
-`NemoDX12SamplerAllocReuse v0.2` moved reuse before final sampler allocation/materialization.
-
-Observed ordinary-play run:
+`NemoDX12SamplerAllocReuse v0.2` observed:
 
 ```text
-sampler_alloc_provisional = 125,772,004
-unique_tables             =   5,089,396
-duplicate_tables          = 108,312,238
-zero_copy_tables          =  12,370,370
 requested_slots_original  = 2,251,985,241
 allocated_slots_real      =    96,277,760
 avoided_slots             = 2,156,696,505
@@ -180,117 +209,90 @@ copy_calls_skipped        =   235,147,658
 Derived:
 
 ```text
-~86.12% duplicate tables
-~9.84% zero-copy tables
-~4.05% real nonzero unique tables
 ~95.77% requested sampler slots avoided
 ~95.12% sampler copy calls skipped
 ```
 
-All safety/error counters were zero.
+A later v0.3 run reproduced roughly `95.18%` avoided slots and `94.49%` skipped copies. Safety/error counters remained zero.
 
-A later v0.3 run reproduced the same scale of reduction (~95.18% slots avoided, ~94.49% copy calls skipped) with all safety counters still zero.
+**FACT:** the fixed-profile sampler path creates large, safely reducible pressure.
 
-**FACT:** sampler allocation/copy pressure created by the fixed-profile path is large and safely reducible.
+**FACT:** the broader heavy-scene slowdown can still occur after that pressure is strongly reduced.
 
-**Important:** the broader heavy-scene slowdown has still occurred in runs where sampler pressure was strongly reduced. Sampler reuse is therefore a validated optimization component, **not the complete root cause or complete fix**.
+Therefore sampler reuse is a validated optimization component, not a complete fix.
 
-See [`experiments.md`](experiments.md) for experiment details.
+## Other ranked global-diff candidates
 
-## Root binding remains a plausible remaining cost
+### `r_proto` lazy render-queue mask resolution
 
-Mapped draw submission:
-
-```text
-1.58.1.4s:0x1401B4800
-1.60.1.7s:0x14029E1F0
-```
-
-The mapped 1.58 path conditionally binds a compact resource table and sampler table.
-
-The mapped 1.60 path can instead:
-
-- scan multiple root-CBV slots
-- issue individual root-CBV updates
-- track several cached root-parameter values
-- handle SRV/UAV/sampler table classes independently
-- bind multiple table roots per profile
-
-The broad structural probe showed this work scales largely with draw count rather than exploding per draw in slow regions. This remains relevant, but broad per-call tracing is too intrusive to use as an unbiased perf measurement.
-
-## Pipeline-cache/profile collision hypothesis is lower priority
-
-Mapped pipeline cache/create path:
+Strong counterpart:
 
 ```text
-1.60.1.7s:0x1402E4D50
+1.58.1.4s:0x141213A20   869 B
+1.60.1.7s:0x1413C1470  1463 B
 ```
 
-Static analysis raised a concern that the visible pre-lookup key is based on six shader identities while profile ID is stored separately on creation.
+1.60 adds lazy resolution when the cached mask is `0xFFFFFFFF`, then caches the result. This makes it more plausible as a streaming/first-use component than a permanent every-frame cost.
 
-Runtime audit result:
+### DX12 resource allocator / TLSF / defragmentation
+
+1.60 contains additional DX12 resource-pool/TLSF/defragmentation code, including a `dx12_pool_t::defragment_data(...)` candidate around `1.60.1.7s:0x14028E320`.
+
+Steady-state activation/frequency is not established, so this remains lower priority.
+
+## Important negative / demoted leads
+
+Do not promote these again without new evidence:
+
+- DirectStorage introduction — backend exists in both builds
+- six-shader tuple/profile collision — `0` conflicts in the measured runtime audit
+- new SRW-lock candidate — traced to `-map_dump` / I/O-cache functionality
+- TAA/rendergraph growth — mainly history-image acquire/init path
+- several large KDOP/vegetation changes — editor/load/build paths
+- traffic-semaphore growth — animated collision-shape initialization
+- several model/unit/UI candidates — setup/configuration rather than steady-state gameplay
+
+## Current technical model
+
+The evidence fits a cumulative model better than a one-bug model:
 
 ```text
-tuple requests          524
-unique shader tuples    377
-same-profile repeats    147
-tuple/profile conflicts 0
+heavy scene / more active work
+  -> more repeated 1.60 CPU-side infrastructure work
+     - render_queue ownership/refcount
+     - descriptor/root-binding overhead
+     - possibly other active p3mem paths
+  -> CPU render construction reaches submit/present later
+
+world rebuild / unload / ferry
+  -> active scene/queue/scope state changes or is rebuilt
+  -> repeated work may drop
+  -> ~16.67 ms behavior can return without process restart
 ```
 
-This is negative evidence against a practical tuple/profile collision in the captured run. It does not prove the invariant globally, but the hypothesis is now lower priority and should not be presented as a confirmed cache bug.
+This is a hypothesis framework, not proof of causality.
 
-## Important telemetry correction
+## Exact next runtime step
 
-`SCS frame_start` telemetry is not guaranteed to be 1:1 with physically rendered frames. At ~45–50 FPS, the callback can still run around 60 Hz and catch up.
+Do not return to a broad D3D profiler.
 
-Do not divide fixed-rate sample counts by `frame_start` count and call that value `ms/rendered-frame`.
-
-Prefer actual rendered-frame timing, wall time and narrow exact counters.
-
-## Runtime methodology constraint
-
-The active save does not provide arbitrary control over test scenes. Main experiments must work during ordinary play in one session rather than requiring hand-picked light/heavy saves or exact scene reproduction.
-
-Broad direct-D3D tracing was also shown to have a substantial observer effect, so future runtime work should prefer lightweight synchronized markers/counters and narrow hooks.
-
-## Best current technical model
+First probe target:
 
 ```text
-heavy scene / more draw work
--> more traffic through the 1.60 fixed-profile descriptor/root-binding architecture
--> large roughly per-draw fixed-capacity bookkeeping
--> sampler allocation/copy pressure (now strongly optimized)
--> remaining descriptor/root-binding/render-construction work
--> CPU reaches submission/present too late
+1.60.1.7s:0x14154AAB0
 ```
 
-The fixed-profile architecture remains the strongest regression-shaped 1.58 -> 1.60 delta, but the successful sampler optimization demonstrates that no single measured sampler cost explains the entire slowdown.
+Collect low-overhead synchronized counters during ordinary gameplay:
 
-## Current direction
+1. helper calls/window
+2. queue-set count from the preserved caller if safe/read-only
+3. cheap count of ownership/refcount-heavy branch entries if identifiable
+4. natural unload/ferry/teleport transitions as context
 
-Do not return to a broad profiler.
+Only if counts/branch behavior correlate with good (~16.7 ms) versus sustained heavy (~20–25 ms) windows should aggregate or sampled timing be added.
 
-Current work should:
+If the measured cost is negligible, demote this branch immediately and continue down the global ranking.
 
-1. keep the validated sampler allocator/copy reuse component;
-2. use lightweight same-session markers/counters around naturally occurring heavy states;
-3. narrow the remaining descriptor/root-binding or scene-state cost without adding tens of thousands of hooked calls per frame;
-4. keep FACT / INFERENCE / HYPOTHESIS separate.
+## Telemetry caveat
 
-## Evidence categories
-
-Keep these separate:
-
-```text
-community reports:
-1.58 good -> 1.59/1.60 bad
-
-our runtime evidence:
-1.60 reproduced and profiled
-sampler allocator/copy pressure strongly reduced safely
-heavy-state regression not fully fixed
-
-our static evidence:
-1.58 vs 1.60 binary/code comparison
-fixed-profile root-signature architecture introduced in mapped 1.60 path
-```
+`SCS frame_start` is not guaranteed to be 1:1 with physically rendered frames. Prefer actual rendered-frame timing, wall time, synchronized counters and narrow exact/aggregate duration measurements.
