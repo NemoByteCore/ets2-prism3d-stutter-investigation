@@ -26,7 +26,7 @@ Primary symptom on the tested setup:
 
 - light scenes can hold roughly ~16.67 ms / ~60 FPS
 - heavier scene compositions commonly reach ~19–25 ms
-- background motion can feel like `start → stop → start → stop`
+- background motion can feel like `start -> stop -> start -> stop`
 - severity depends on scene composition
 - unload/ferry/teleport transitions can sometimes restore ~16.67 ms without restarting the game
 
@@ -46,99 +46,53 @@ Changing loaded scene state can move the same running game between a slower ~19�
 
 `NemoInstanceStateProbe` showed highly dynamic instancing activity, but raw bytes/chunks/clusters did not track frametime strongly enough to explain the slowdown by themselves.
 
-### Sampler descriptor redundancy is real
+## 1.60 shader-profile architecture is materially different from 1.58
 
-`NemoDX12SamplerReuse v0.4` safely skipped redundant sampler `CopyDescriptorsSimple` work in the tested flow.
-
-Observed runs showed roughly **95–96%** of the targeted sampler copies were redundant. The user reported a small subjective improvement.
-
-**Interpretation:** this optimization remains a plausible component of a final patch, but it does not by itself explain the whole regression.
-
-## Important telemetry correction
-
-`SCS frame_start` telemetry is not guaranteed to be 1:1 with physically rendered frames. At ~45–50 FPS, the callback can still run around 60 Hz and catch up.
-
-Do not divide fixed-rate sample counts by `frame_start` count and call that value `ms/rendered-frame`.
-
-Prefer:
-
-- wall time
-- samples/s
-- exact call-duration instrumentation
-- actual rendered-frame timing when testing frame-synchronous hypotheses
-
-## Mapped render/resource chain
-
-High-confidence mapped path in 1.60:
+High-confidence mapped chain in 1.60:
 
 ```text
 RFX pass / shader profile
-  ↓
-resource bucketization + cross-stage merge
-  ↓
-composite uniform-builder merge when needed
-  ↓
-r_item
-  ↓
-1.60.1.7s:0x14144C770
-  ↓
-1.60.1.7s:0x1402D7D70
-  ↓
-r_resource_bundle_t
-  ↓
-1.60.1.7s:0x1402942D0
-  ↓
-DX12 descriptor update/build
-  ↓
-1.60.1.7s:0x14029E1F0
-  ↓
-generalized root-parameter submission
+  -> resource bucketization + cross-stage merge
+  -> composite uniform-builder merge when needed
+  -> r_item
+  -> 1.60.1.7s:0x14144C770
+  -> 1.60.1.7s:0x1402D7D70
+  -> r_resource_bundle_t
+  -> 1.60.1.7s:0x1402942D0
+  -> DX12 descriptor update/build
+  -> 1.60.1.7s:0x14029E1F0
+  -> generalized root-parameter submission
 ```
 
 Important mapped counterparts:
 
 ```text
-1.60.1.7s:0x1402D7D70  ↔  1.58.1.4s:0x1401EB530
-1.60.1.7s:0x1402E25A0  ↔  1.58.1.4s:0x1401F4FB0
-1.60.1.7s:0x14144C770  ↔  1.58.1.4s:0x14129BF20
-1.60.1.7s:0x1402942D0  ↔  1.58.1.4s:0x1401AC780
-1.60.1.7s:0x14029E1F0  ↔  1.58.1.4s:0x1401B4800
+1.60.1.7s:0x1402D7D70  <->  1.58.1.4s:0x1401EB530
+1.60.1.7s:0x1402E25A0  <->  1.58.1.4s:0x1401F4FB0
+1.60.1.7s:0x14144C770  <->  1.58.1.4s:0x14129BF20
+1.60.1.7s:0x1402942D0  <->  1.58.1.4s:0x1401AC780
+1.60.1.7s:0x14029E1F0  <->  1.58.1.4s:0x1401B4800
 ```
 
-See [`function-map.md`](function-map.md) for mapping evidence.
-
-## Confirmed static architecture delta
-
-The strongest regression-shaped architectural difference found so far is now specific enough to test directly.
-
-### 1.58 model
-
-The mapped 1.58 DX12 path builds a root signature from the actual pipeline layout.
+The mapped 1.58 DX12 path builds a root signature from the actual pipeline layout. 1.60 instead selects one of **13 fixed DX12 root-signature profiles**.
 
 ```text
-actual pipeline layout
-→ layout-specific root signature
-→ layout-specific descriptor capacities
-→ compact resource descriptor table
-→ compact sampler descriptor table
-```
+1.58:
+actual layout
+-> layout-specific root signature
+-> layout-specific descriptor capacities
+-> compact resource table + sampler table
 
-CBV/SRV/UAV ranges are aggregated into the resource table in the mapped path.
-
-### 1.60 model
-
-1.60 introduces shader-profile selection and chooses one of **13 fixed DX12 root-signature profiles**.
-
-```text
+1.60:
 RFX shader profile
-→ fixed root-signature profile
-→ fixed descriptor capacities
-→ individual root CBVs
-→ split SRV/UAV/sampler tables by set/visibility
-→ generalized root-parameter submission
+-> fixed root-signature profile
+-> fixed descriptor capacities
+-> individual root CBVs
+-> split SRV/UAV/sampler tables by set/visibility
+-> generalized root-parameter submission
 ```
 
-Exact profile names:
+Exact 1.60 profile names:
 
 ```text
 0  compute
@@ -156,7 +110,7 @@ Exact profile names:
 12 sky
 ```
 
-Selected profile capacities:
+Selected fixed capacities:
 
 | Profile | Root params | Root CBVs | Resource slots | Sampler slots | Table roots |
 |---|---:|---:|---:|---:|---:|
@@ -165,19 +119,85 @@ Selected profile capacities:
 | `fullscreen` | 8 | 4 | 24 | 16 | 4 |
 | `material_lite` | 6 | 4 | 6 | 6 | 2 |
 
-Full table and decoding details are in [`shader-profile-architecture-delta.md`](shader-profile-architecture-delta.md).
+See [`shader-profile-architecture-delta.md`](shader-profile-architecture-delta.md).
 
-## Descriptor reservation is profile-capacity driven in 1.60
+## Fixed profile reservation is now confirmed at runtime
 
-`1.60.1.7s:0x1402942D0` resolves the selected profile and uses profile totals when reserving resource and sampler descriptor-heap slots.
+`1.60.1.7s:0x1402942D0` passes fixed root-profile totals to the descriptor allocator. A broad structural runtime probe showed that, in active gameplay, fixed capacity is much larger than actual layout demand.
 
-For example, the `material` profile carries capacity for 20 resource descriptors and 20 samplers.
+Median active-frame ratios from that run:
 
-**FACT:** reservation is based on fixed profile capacity.
+```text
+reserved resource capacity / actual resource-layout demand ~7.62x
+reserved sampler capacity  / actual sampler demand         ~8.34x
+```
 
-**Open runtime question:** how many of those reserved slots are actually written/copied on typical draws?
+Typical per-draw sampler values were roughly:
 
-## Root binding is more fragmented in 1.60
+```text
+reserved sampler slots ~18.0/draw
+actual sampler bindings ~2.12/draw
+```
+
+The `material` profile accounted for about 87% of active gameplay draws in that capture.
+
+The probe itself was too intrusive for absolute frametime attribution, but these structural ratios are useful.
+
+## Sampler heap pressure is a real optimization target
+
+Static allocator reconstruction shows:
+
+```text
+1.60.1.7s:0x14028F070  descriptor allocation / cursor advance
+sampler heap capacity   0x800 = 2,048 descriptors
+resource heap capacity  0x80000 = 524,288 descriptors
+```
+
+The fixed profile sampler spans therefore matter much more for heap pressure than the same style of over-reservation on the much larger resource heap.
+
+### Earlier copy-only result
+
+`NemoDX12SamplerReuse v0.4` safely skipped roughly 95–96% of targeted sampler descriptor copies, but deliberately left Prism's original sampler allocations untouched. The user reported a small subjective improvement.
+
+### Allocator-side reuse result
+
+`NemoDX12SamplerAllocReuse v0.2` moved reuse before final sampler allocation/materialization.
+
+Observed ordinary-play run:
+
+```text
+sampler_alloc_provisional = 125,772,004
+unique_tables             =   5,089,396
+duplicate_tables          = 108,312,238
+zero_copy_tables          =  12,370,370
+requested_slots_original  = 2,251,985,241
+allocated_slots_real      =    96,277,760
+avoided_slots             = 2,156,696,505
+sampler_copy_calls_seen   =   247,221,488
+copy_calls_skipped        =   235,147,658
+```
+
+Derived:
+
+```text
+~86.12% duplicate tables
+~9.84% zero-copy tables
+~4.05% real nonzero unique tables
+~95.77% requested sampler slots avoided
+~95.12% sampler copy calls skipped
+```
+
+All safety/error counters were zero.
+
+A later v0.3 run reproduced the same scale of reduction (~95.18% slots avoided, ~94.49% copy calls skipped) with all safety counters still zero.
+
+**FACT:** sampler allocation/copy pressure created by the fixed-profile path is large and safely reducible.
+
+**Important:** the broader heavy-scene slowdown has still occurred in runs where sampler pressure was strongly reduced. Sampler reuse is therefore a validated optimization component, **not the complete root cause or complete fix**.
+
+See [`experiments.md`](experiments.md) for experiment details.
+
+## Root binding remains a plausible remaining cost
 
 Mapped draw submission:
 
@@ -196,9 +216,9 @@ The mapped 1.60 path can instead:
 - handle SRV/UAV/sampler table classes independently
 - bind multiple table roots per profile
 
-This is a static architectural difference, not yet measured proof of the observed frametime loss.
+The broad structural probe showed this work scales largely with draw count rather than exploding per draw in slow regions. This remains relevant, but broad per-call tracing is too intrusive to use as an unbiased perf measurement.
 
-## Pipeline-cache/profile identity audit remains open
+## Pipeline-cache/profile collision hypothesis is lower priority
 
 Mapped pipeline cache/create path:
 
@@ -206,81 +226,56 @@ Mapped pipeline cache/create path:
 1.60.1.7s:0x1402E4D50
 ```
 
-The visible pre-lookup cache identity is derived from six shader identities, while the selected profile ID is stored on the created pipeline and later controls root-signature selection.
+Static analysis raised a concern that the visible pre-lookup key is based on six shader identities while profile ID is stored separately on creation.
 
-A cache hit returns before an explicit requested-profile comparison is visible in this function.
+Runtime audit result:
 
-**HYPOTHESIS / audit target:** determine whether the same six-shader tuple can ever be requested with more than one profile ID.
+```text
+tuple requests          524
+unique shader tuples    377
+same-profile repeats    147
+tuple/profile conflicts 0
+```
 
-This is **not a confirmed cache bug**. The asset/data model may guarantee one profile per shader tuple.
+This is negative evidence against a practical tuple/profile collision in the captured run. It does not prove the invariant globally, but the hypothesis is now lower priority and should not be presented as a confirmed cache bug.
+
+## Important telemetry correction
+
+`SCS frame_start` telemetry is not guaranteed to be 1:1 with physically rendered frames. At ~45–50 FPS, the callback can still run around 60 Hz and catch up.
+
+Do not divide fixed-rate sample counts by `frame_start` count and call that value `ms/rendered-frame`.
+
+Prefer actual rendered-frame timing, wall time and narrow exact counters.
+
+## Runtime methodology constraint
+
+The active save does not provide arbitrary control over test scenes. Main experiments must work during ordinary play in one session rather than requiring hand-picked light/heavy saves or exact scene reproduction.
+
+Broad direct-D3D tracing was also shown to have a substantial observer effect, so future runtime work should prefer lightweight synchronized markers/counters and narrow hooks.
 
 ## Best current technical model
 
 ```text
-heavy scene / more complex draw mix
-→ more work through 1.60 shader-profile binding architecture
-→ fixed profile-capacity reservation
-→ expanded descriptor/root-binding bookkeeping
-→ CPU reaches submission/present too late
+heavy scene / more draw work
+-> more traffic through the 1.60 fixed-profile descriptor/root-binding architecture
+-> large roughly per-draw fixed-capacity bookkeeping
+-> sampler allocation/copy pressure (now strongly optimized)
+-> remaining descriptor/root-binding/render-construction work
+-> CPU reaches submission/present too late
 ```
 
-This is the strongest current regression model, but runtime correlation is still required.
+The fixed-profile architecture remains the strongest regression-shaped 1.58 -> 1.60 delta, but the successful sampler optimization demonstrates that no single measured sampler cost explains the entire slowdown.
 
-## Current runtime constraint
+## Current direction
 
-The active save does not provide arbitrary control over test scenes.
+Do not return to a broad profiler.
 
-Do not design the main experiment around:
+Current work should:
 
-- hand-picked stable light/heavy scenes
-- separate debug saves
-- arbitrary teleporting solely for measurement
-- reproducing two exact scene compositions on demand
-
-The valid methodology must work during normal play on the current save.
-
-## NemoShaderProfileProbe v0.1 status
-
-`NemoShaderProfileProbe v0.1` built successfully, but its original test protocol is rejected for root-cause/patch decisions.
-
-Reasons include:
-
-- separate light/heavy runs do not fit the available save
-- it lacks a sufficiently synchronized actual rendered-frametime signal
-- decoded layout counts are not the same thing as actual descriptor writes/copies
-- predicted root-CBV/table activity is not direct `SetGraphicsRoot*` instrumentation
-- whole-run totals cannot show what changes exactly when frametime worsens
-
-The v0.1 artifact remains an implementation reference only.
-
-## Next step — NemoShaderProfileProbe v0.2
-
-Design a **single-session, save-compatible, profile-aware runtime probe**.
-
-Preferred experiment shape:
-
-```text
-one ordinary gameplay session
-→ continuous actual rendered frametime
-→ continuous profile/resource/root-binding counters
-→ short synchronized windows
-→ post-hoc split into good/bad frametime regions
-```
-
-High-value counters:
-
-- draw/work count by profile ID
-- descriptor-builder time
-- resource/sampler slots reserved by profile
-- actual descriptor writes/copies where directly instrumented
-- actual root-CBV API calls where directly instrumented
-- actual descriptor-table binds where directly instrumented
-- root-signature/profile switches
-- descriptor heap rollover/switches
-- shader-tuple/profile conflicts
-- actual rendered frametime aligned with the above
-
-The useful question is not merely whether a visually heavier scene does more work. It is **which measured work changes disproportionately and synchronously when actual rendered frametime worsens inside the same session**.
+1. keep the validated sampler allocator/copy reuse component;
+2. use lightweight same-session markers/counters around naturally occurring heavy states;
+3. narrow the remaining descriptor/root-binding or scene-state cost without adding tens of thousands of hooked calls per frame;
+4. keep FACT / INFERENCE / HYPOTHESIS separate.
 
 ## Evidence categories
 
@@ -288,11 +283,14 @@ Keep these separate:
 
 ```text
 community reports:
-1.58 good → 1.59/1.60 bad
+1.58 good -> 1.59/1.60 bad
 
 our runtime evidence:
 1.60 reproduced and profiled
+sampler allocator/copy pressure strongly reduced safely
+heavy-state regression not fully fixed
 
 our static evidence:
 1.58 vs 1.60 binary/code comparison
+fixed-profile root-signature architecture introduced in mapped 1.60 path
 ```
