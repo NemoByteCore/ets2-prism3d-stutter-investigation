@@ -22,147 +22,76 @@ SHA-256:   AB9785331BF9970542C61A0108A4E677C9F7C00FD316D4C0F9AB116F6BE6C234
 
 **1.58.1.4s is never run.**
 
-## Primary runtime symptoms
+## Symptom
 
-On the tested setup:
+The tested setup can hold roughly `16.67 ms / 60 FPS` in light states and sustain roughly `19–25 ms` in heavier scene compositions. The state is scene-dependent rather than a single hitch and can sometimes clear after an unload/ferry/teleport transition.
 
-- light scenes can hold roughly `16.67 ms / 60 FPS`
-- heavier scene compositions commonly reach roughly `19–25 ms`
-- the slower state can be sustained rather than a single hitch
-- severity strongly depends on scene composition
-- unload/ferry/teleport transitions can sometimes restore ~16.67 ms without restarting the game
-
-## Whole-corpus diff status
+## Whole-corpus diff
 
 ```text
-1.58 function inventory: 66,820
-1.60 function inventory: 68,834
-confirmed counterpart pairs: 58,589
-coverage of 1.58: 87.68%
-coverage of 1.60: 85.12%
+1.58 functions:                    66,820
+1.60 functions:                    68,834
+confirmed counterpart pairs:       58,589
 materially changed confirmed pairs: 9,308
-strong anchored 1.60-only: 597
-strong anchored 1.58-only: 375
-ambiguous unmatched regions: 3,370
+strong anchored 1.60-only:            597
+strong anchored 1.58-only:            375
+ambiguous unmatched regions:         3,370
 ```
 
 See [`global-diff-summary.md`](global-diff-summary.md).
 
-## Strong isolated static candidates were demoted by runtime measurement
+The global diff remains the static map, but runtime measurement now decides which branches deserve deeper work.
 
-### `render_queue_set_t` copy helper
+## Important runtime-demoted static leads
 
-```text
-1.60.1.7s:0x14154AAB0
-```
+- `0x14154AAB0` render-queue copy helper: only **14 direct calls across 24,798 rendered frames**.
+- `0x1413C1470` r_proto boundary: no usable direct-call boundary for the proposed probe.
+- `0x1408DC510` traffic neighbor update: only **85 total calls**, including a heavy-state onset interval with no calls.
 
-Despite a strong 1.58/1.60 static delta, runtime measurement found only **14 direct calls across 24,798 rendered frames**.
+These findings are why the project no longer promotes candidates merely because a 1.60 function became larger or gained new p3mem/refcount machinery.
 
-**Decision:** strongly demote the direct-cost theory.
+## Runtime localization
 
-### `r_proto` lazy-resolution boundary
-
-```text
-1.60.1.7s:0x1413C1470
-```
-
-No direct `E8 rel32` callsites or incoming direct-call edges were found for the proposed instrumentation boundary.
-
-**Decision:** do not repeat the same direct-call probe without new reachability evidence.
-
-### `traffic_trajectory_t::update_neighbors_bits`
-
-```text
-1.60.1.7s:0x1408DC510
-```
-
-The target executed only **85 times** in the whole run. A natural heavy-state transition occurred across an approximately **42.17 s interval with no calls to the target at all**.
-
-**Decision:** direct execution cost is far too sparse to own the sustained frame budget.
-
-## Runtime-first phase localization
-
-The measured main-loop chain is:
+Measured chain:
 
 ```text
 0x1401C5280  outer loop owner
-    -> 0x1401C77C0  main-loop iteration
-          -> 0x1401C6CB0  frame-clock / duration bookkeeping
-          -> 0x1401D72F0  rendergraph / present coordinator
-                -> 0x14021FE20  RG_CORE / rendergraph execution stage
+  -> 0x1401C77C0  LOOP
+       -> 0x1401C6CB0  PACE
+       -> 0x1401D72F0  RENDER
+            -> 0x14011F730  WAIT
+            -> 0x14021FE20  RG_CORE
 ```
 
-`PACE` stays around `~0.001 ms/iteration` and is negligible.
-
-`NemoFramePhaseProbe v0.2` separated the nested `Sleep()` + spin helper `0x14011F730`. In clean good-vs-heavy gameplay windows:
+### v0.2 — active render + other loop work both grow
 
 ```text
              GOOD       HEAVY      DELTA
 LOOP         16.683 ms  20.358 ms  +3.675 ms
 RENDER_ACTIVE11.404 ms  13.507 ms  +2.103 ms
 OTHER         5.253 ms   6.840 ms  +1.586 ms
-WAIT          0.024 ms   0.009 ms  -0.015 ms / loop
+WAIT          0.024 ms   0.009 ms  -0.015 ms
 ```
 
-**FACT:** the measured WAIT helper does not explain the heavy-state slowdown.
+PACE is negligible. The measured WAIT helper is sparse and does not own the slowdown.
 
-## v0.3: the broad buckets are now localized
-
-`v0.3` split `OTHER` into pre/post-render portions and measured selected immediate children of `0x1401D72F0`.
-
-A clean sustained heavy episode versus recovered ordinary gameplay:
+### v0.3 — broad cost localized
 
 ```text
                               RECOVERED   HEAVY      DELTA
 LOOP                           16.672 ms   19.735 ms  +3.063 ms
-RENDER_ACTIVE                   9.983 ms   11.593 ms  +1.610 ms
-OTHER                           6.667 ms    8.132 ms  +1.465 ms
 PRE_RENDER_OTHER                6.285 ms    7.752 ms  +1.467 ms
 POST_RENDER_OTHER               0.381 ms    0.380 ms  ~0
 RG_CORE                         6.271 ms    8.964 ms  +2.693 ms
 ```
 
-The instrumentation safety/accounting counters stayed clean, and the clean baseline remained essentially identical to v0.2.
+**FACT:** the non-render growth is pre-render work.
 
-**FACT:** the non-render increase is specifically **pre-render work**.
+**FACT:** among the selected immediate render children, the positive heavy-state growth is concentrated almost entirely in `RG_CORE = 0x14021FE20`.
 
-**FACT:** post-render cleanup is flat.
+### v0.4 — raw rendergraph cardinality is not enough
 
-**FACT:** among the selected direct RENDER children, the positive heavy-state delta is concentrated almost entirely in:
-
-```text
-RG_CORE = 1.60.1.7s:0x14021FE20
-```
-
-See [`rg-core-runtime-localization.md`](rg-core-runtime-localization.md).
-
-## v0.4: raw rendergraph cardinality contributes, but is not sufficient
-
-`RG_CORE` iterates a rendergraph execution-order array. `v0.4` sampled, read-only, at entry:
-
-```text
-order_count = state + 0x160
-pass_count  = state + 0xB8
-sync_flag   = state + 0x218
-```
-
-No new game target detours were added.
-
-Across nine clean sustained heavy windows:
-
-```text
-                              GOOD        HEAVY       DELTA
-LOOP                          16.689 ms   20.116 ms   +3.427 ms
-RENDER_ACTIVE                 10.123 ms   12.071 ms   +1.949 ms
-PRE_RENDER_OTHER               6.177 ms    7.602 ms   +1.425 ms
-RG_CORE                        5.896 ms    9.417 ms   +3.521 ms
-order_count                  157.5       183.5       +26.0
-pass_count                   158.5       184.5       +26.0
-```
-
-Two heavy episodes show large count jumps from roughly `145` to roughly `190+`, so cardinality can contribute.
-
-However, matched-cardinality windows show:
+Some heavy episodes do have more rendergraph passes. But matched-cardinality windows show:
 
 ```text
                               SMOOTH      HEAVY
@@ -172,80 +101,111 @@ order_count                  192.88      191.16
 pass_count                   193.88      192.16
 ```
 
-At essentially identical raw pass/order count, `RG_CORE` is about **2.91 ms slower** in the heavy state.
+The sampled synchronization flag was never active (`0 / 86,942`).
 
-There are also smooth windows above 210 order entries with `RG_CORE` only around ~5.7–6.0 ms.
+**FACT:** total order/pass count is not a sufficient heavy-state discriminator.
 
-The sampled synchronization flag was never active:
+### v0.5 — matched composition still differs by several milliseconds
 
-```text
-sync_hits = 0 / 86,942
-```
-
-**FACT:** raw pass count is not sufficient to explain the heavy state.
-
-**INFERENCE:** pass composition and/or per-pass workload is now a stronger discriminator than total count.
-
-## Current RG_CORE static discriminator
-
-The `0x14021FE20` pseudocode dispatches execution-order-selected passes by a type at `pass + 0x8`, with supported types `1..7`.
-
-Exact runtime-consumed fields suitable for low-rate read-only sampling include:
+`v0.5` sampled actual execution-order-selected pass types and several exact work-count fields already read by RG_CORE:
 
 ```text
-pass + 0x1338  raw list count consumed before dispatch
-pass + 0x19A8  callback/work-object pointer
-pass + 0xDB0   count consumed by the type-4 helper
-pass + 0x12D0  reference count iterated by type-7
+type 1..7 counts
+callback-present count
+pass + 0x1338 raw count
+type-4 pass + 0xDB0 items
+type-7 pass + 0x12D0 refs
 ```
 
-The `+0x1338` field is intentionally not given a stronger semantic name than the pseudocode supports.
+The run was structurally clean: `97,290` LOOP calls, `97,287` RENDER/RG_CORE calls, only 3 no-render loops, and zero order mismatch, overlap, reentry, bad-end, thread-mismatch or child-sum accounting violations. Sync remained zero.
 
-## Descriptor / root-binding architecture remains a confirmed component
-
-The mapped 1.58 DX12 path derives root signatures and descriptor capacities from actual pipeline layout. The mapped 1.60 path selects fixed shader/root-signature profiles with fixed capacities.
-
-Runtime probing confirmed large fixed-capacity over-reservation. `NemoDX12SamplerAllocReuse` safely removed roughly **95%** of targeted sampler allocation/copy pressure with clean safety counters.
-
-The broader heavy-scene slowdown still occurs with that optimization active.
-
-**Conclusion:** descriptor/sampler work is a validated optimization component, not a complete explanation.
-
-See [`shader-profile-architecture-delta.md`](shader-profile-architecture-delta.md).
-
-## Broad 1.60 `p3mem` migration remains a structural fact
-
-The global corpus shows:
+Decisive matched pair A:
 
 ```text
-direct _malloc_base calls:
-1.58: 4,212
-1.60:   260
-
-1.60 p3_alloc path:       0x140117240  (~1,485 static incoming edges)
-1.60 lifetime/free path:  0x140117400  (~3,828 static incoming edges)
+                              SMOOTH      HEAVY
+LOOP                          16.568 ms   19.412 ms
+RG_CORE                        6.832 ms    9.825 ms
+order/pass                    159/160     159/160
+T1                              134         134
+T3                                1           1
+T4                               10          10
+T6                                5           5
+T7                                8           8
+callback-present                159         159
+raw +0x1338                     288         282
+type4 items                      10          10
+type7 refs                        7           7
 ```
 
-This remains important architectural context, but runtime negatives show why static prevalence alone is not enough. Generic p3mem hooks/patches are not justified.
-
-## Current technical direction
-
-Immediate runtime question:
-
-> At approximately the same total rendergraph cardinality, which pass types / exact per-pass work counts differ between smooth ~16.7 ms and heavy ~20 ms states?
-
-Current workflow:
+Decisive matched pair B:
 
 ```text
-matched-cardinality smooth vs heavy
-  -> low-rate pass mix / work-count sampling inside RG_CORE
-  -> recurse only into the separating pass family/path
-  -> if no composition difference, branch timing or CPU stack sampling
-  -> map the measured hotspot to the completed 1.58 ↔ 1.60 counterpart set
-  -> patch only after the missing-ms budget is measured
+                              SMOOTH      HEAVY
+LOOP                          16.704 ms   20.024 ms
+RG_CORE                        5.126 ms    9.904 ms
+order/pass                    158/159     158/159
+T1                              134         134
+T4                               10          10
+T6                                5           5
+T7                                8           8
 ```
 
-## Important negative / demoted leads
+A third `157/158` matched pair differs by about `+4.10 ms` in RG_CORE with essentially the same sampled mix/work counts.
+
+**FACT:** the coarse pass composition/work fields measured by v0.5 are not sufficient to explain the heavy-state RG_CORE cost.
+
+**INFERENCE:** broadly the same rendergraph work is becoming materially more expensive to execute; the next useful measurement is elapsed time inside execution paths rather than additional count fields.
+
+See [`rg-core-runtime-localization.md`](rg-core-runtime-localization.md).
+
+## Current RG_CORE branch targets
+
+Static inspection of `0x14021FE20` identifies three clean direct helper paths:
+
+```text
+0x14021F560  type-1 helper
+0x14021F780  type-4 helper
+0x1402DE540  type-7 per-reference helper
+```
+
+Type 1 dominates the observed pass mix. Its helper performs device-facing work and invokes a pass-specific callback when present, so it is the strongest first timing discriminator without assuming it is the answer.
+
+The type-4 helper processes its item list and callback/device work. The type-7 helper executes once per type-7 reference.
+
+## Immediate technical direction
+
+`v0.6` keeps accepted v0.3 timing and v0.4 cardinality, removes the v0.5 pass-mix scanner, and sampled-times only every 16th execution of the three helper callsites above.
+
+```text
+matched smooth vs heavy
+  -> compare sampled type-1 / type-4 / type-7 helper duration
+  -> recurse only into the measured winning branch
+  -> if none explains the delta, isolate RG_CORE residual/tail or use differential CPU stack sampling
+  -> map measured hotspot to 1.58 ↔ 1.60 counterpart
+  -> patch only after a concrete missing-ms budget is localized
+```
+
+No behavior patch is justified yet.
+
+## Descriptor/root-binding architecture
+
+The mapped 1.58/1.60 DX12 descriptor/root-binding difference remains confirmed. `NemoDX12SamplerAllocReuse` safely removes roughly **95%** of targeted sampler allocation/copy pressure, but sustained heavy-scene slowdown still occurs with that optimization active.
+
+Therefore the descriptor branch is a real optimization/regression component, not a complete explanation. See [`shader-profile-architecture-delta.md`](shader-profile-architecture-delta.md).
+
+## Broad 1.60 p3mem migration
+
+The global corpus still shows the broad allocator/scope migration:
+
+```text
+direct _malloc_base calls: 1.58 = 4,212; 1.60 = 260
+1.60 p3_alloc path:      0x140117240  (~1,485 incoming edges)
+1.60 lifetime/free path: 0x140117400  (~3,828 incoming edges)
+```
+
+This is structural context, not permission to hook or patch p3mem globally.
+
+## Demoted / insufficient explanations
 
 Do not promote these again without new evidence:
 
@@ -259,9 +219,10 @@ Do not promote these again without new evidence:
 - direct-cost theory for `0x14154AAB0`
 - repeated direct-call probing of `0x1413C1470`
 - direct-cost theory for `0x1408DC510`
-- measured WAIT helper as the sustained regression owner
-- raw `RG_CORE` pass/order count as a sufficient explanation
+- measured WAIT helper as sustained owner
+- raw RG_CORE pass/order count as a sufficient explanation
+- v0.5 coarse pass mix / measured work-count fields as a sufficient explanation
 
 ## Telemetry caveat
 
-`SCS frame_start` is not guaranteed to be 1:1 with physically rendered frames. Prefer actual rendered-frametime timing, wall time, synchronized counters and narrow aggregate duration measurements.
+`SCS frame_start` is not guaranteed to be 1:1 with physically rendered frames. Prefer rendered-frametime timing, wall time, synchronized counters and narrow aggregate duration measurements.
