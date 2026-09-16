@@ -4,7 +4,7 @@ Updated: **2026-09-16**
 
 This document summarizes the runtime pivot that followed the completed `1.58.1.4s ↔ 1.60.1.7s` whole-corpus diff.
 
-The purpose of the pivot is simple: stop choosing isolated static candidates one by one and first measure **which coarse CPU phase actually owns the missing milliseconds** in the sustained heavy state.
+The purpose of the pivot is simple: stop choosing isolated static candidates one by one and first measure **which CPU phase actually owns the missing milliseconds** in the sustained heavy state.
 
 ## Ranked static candidates that were demoted at runtime
 
@@ -40,7 +40,7 @@ Target:
 1.60.1.7s:0x1408DC510
 ```
 
-The target executed only **85 times** in the whole run, including a 30-call shutdown/unload-adjacent burst. A natural transition from about **16.775 ms/frame** to **22.268 ms/frame** occurred across an approximately **42.17 s interval with no calls to the target at all**.
+The target executed only **85 times** in the whole run. A natural transition from about **16.775 ms/frame** to **22.268 ms/frame** occurred across an approximately **42.17 s interval with no calls to the target at all**.
 
 **Conclusion:** direct execution cost at this target is far too sparse to own the sustained frame budget.
 
@@ -102,11 +102,9 @@ bad_end = 0
 thread mismatch = 0
 ```
 
-The WAIT helper is therefore **conditional and sparse**, not a global once-per-frame pacing gate.
+The WAIT helper is **conditional and sparse**, not a global once-per-frame pacing gate.
 
-## Aggregate good-vs-heavy result
-
-Using ordinary gameplay phase windows `8..111`, classifying clean good windows as `LOOP <= 17.0 ms` and heavy windows as `LOOP >= 19.0 ms`, then weighting by loop-call count:
+Using clean ordinary gameplay windows:
 
 ```text
              GOOD       HEAVY      DELTA
@@ -117,55 +115,101 @@ WAIT          0.024 ms   0.009 ms  -0.015 ms / loop
 CPU_ACTIVE   16.659 ms  20.349 ms  +3.690 ms
 ```
 
-At this coarse resolution, roughly **57%** of the measured heavy-state delta is in `RENDER_ACTIVE` and roughly **43%** is in `OTHER`.
+**Conclusion:** the v0.1 RENDER increase was not just lost/redistributed time in this measured wait helper. Active render-side CPU work genuinely rises.
 
-The WAIT contribution is only tens of microseconds per loop and actually decreases slightly in heavy windows.
+## v0.3: split the active buckets
 
-**Conclusion:** the v0.1 RENDER increase was not just lost/redistributed time in this measured sleep/spin helper. Active render-side CPU work genuinely rises.
+`v0.3` retained the accepted LOOP/PACE/RENDER/WAIT boundaries and added selected immediate direct-child timing inside `RENDER` using callsite-specific wrappers with non-overlap accounting.
 
-## Natural episode checks
-
-The aggregate split is not driven by one isolated outlier.
-
-### Episode A
-
-Immediate baseline vs full heavy/recovery episode:
+It also derives:
 
 ```text
-LOOP          +3.027 ms
-RENDER_ACTIVE +1.370 ms
-OTHER         +1.673 ms
-WAIT          -0.017 ms
+PRE_RENDER_OTHER  = (RENDER_begin - LOOP_begin) - PACE
+POST_RENDER_OTHER = LOOP_end - RENDER_end
 ```
 
-Central peak:
+The structural accounting gate passed throughout the run: no overlap, reentry, bad-end, thread-mismatch or child-sum violations were observed.
+
+The clean `LOOP <= 17 ms` baseline remained effectively unchanged from v0.2 (`16.685 ms` vs `16.683 ms`).
+
+A clean sustained heavy episode compared with recovered ordinary gameplay:
 
 ```text
-LOOP          +3.870 ms
-RENDER_ACTIVE +2.172 ms
-OTHER         +1.712 ms
+                              RECOVERED   HEAVY      DELTA
+LOOP                           16.672 ms   19.735 ms  +3.063 ms
+RENDER_ACTIVE                   9.983 ms   11.593 ms  +1.610 ms
+OTHER                           6.667 ms    8.132 ms  +1.465 ms
+PRE_RENDER_OTHER                6.285 ms    7.752 ms  +1.467 ms
+POST_RENDER_OTHER               0.381 ms    0.380 ms  ~0
+RENDER_CHILD_SUM                6.645 ms    9.367 ms  +2.722 ms
+RENDER_SELF_RESIDUAL            3.337 ms    2.226 ms  -1.112 ms
 ```
 
-### Episode B
-
-Immediate baseline vs heavy/recovery:
+The selected immediate render-child delta was:
 
 ```text
-LOOP          +1.561 ms
-RENDER_ACTIVE +0.690 ms
-OTHER         +0.882 ms
-WAIT          -0.010 ms
+RG_CORE 0x14021FE20       +2.693 ms
+RG_PRESENT_RESOLVE        +0.021 ms
+all other selected children approximately flat/tiny
 ```
 
-Central peak:
+**Conclusion:** the non-render growth is specifically pre-render work, while the selected render-side positive delta is overwhelmingly localized to `RG_CORE 0x14021FE20`.
+
+## v0.4: cardinality/state sampling at RG_CORE
+
+The `RG_CORE` pseudocode iterates a rendergraph execution-order array:
 
 ```text
-LOOP          +2.311 ms
-RENDER_ACTIVE +1.265 ms
-OTHER         +1.065 ms
+order_base  = *(u32 **)(state + 0x158)
+order_count = *(u64 *)(state + 0x160)
+pass_base   = *(ptr **)(state + 0xB0)
+pass_count  = *(u64 *)(state + 0xB8)
+sync_flag   = *(u8 *)(state + 0x218)
 ```
 
-The independent `NemoFrame` logger tracks both episodes in the same direction.
+`v0.4` reused the existing `RG_CORE` wrapper and sampled only `order_count`, `pass_count` and `sync_flag` at entry. No new game target detours were added.
+
+Safety remained clean. The clean gameplay baseline was about `16.689 ms`, effectively unchanged from v0.3/v0.2.
+
+Across nine clean heavy windows in three natural episodes:
+
+```text
+                              GOOD        HEAVY       DELTA
+LOOP                          16.689 ms   20.116 ms   +3.427 ms
+RENDER_ACTIVE                 10.123 ms   12.071 ms   +1.949 ms
+PRE_RENDER_OTHER               6.177 ms    7.602 ms   +1.425 ms
+RG_CORE                        5.896 ms    9.417 ms   +3.521 ms
+order_count                  157.5       183.5       +26.0
+pass_count                   158.5       184.5       +26.0
+```
+
+Two episodes showed large count jumps from roughly `145` to roughly `190+`. Therefore raw rendergraph cardinality can contribute to heavy episodes.
+
+### Matched-cardinality negative
+
+The same run also contains many smooth ~16.67 ms windows with order counts around `190–223`.
+
+Matched-cardinality comparison (`order_avg 184..205`):
+
+```text
+                              SMOOTH      HEAVY
+LOOP                          16.696 ms   19.851 ms
+RENDER_ACTIVE                  9.642 ms   11.935 ms
+PRE_RENDER_OTHER               6.615 ms    7.473 ms
+RG_CORE                        6.253 ms    9.161 ms
+order_count                  192.88      191.16
+pass_count                   193.88      192.16
+```
+
+At essentially the same pass/order count, `RG_CORE` is about **+2.91 ms slower** in the heavy state.
+
+The synchronization flag was never active:
+
+```text
+sync_hits = 0 / 86,942
+```
+
+**Conclusion:** more passes can matter, but total pass count alone is not the root discriminator. The same count can execute substantially slower.
 
 ## Current interpretation
 
@@ -173,19 +217,34 @@ The independent `NemoFrame` logger tracks both episodes in the same direction.
 
 **FACT:** the measured WAIT helper does not own the heavy-state regression.
 
-**FACT:** both active render work and non-render residual main-loop work increase materially in heavy state.
+**FACT:** non-render growth is pre-render, not post-render.
 
-**INFERENCE:** at this resolution the missing CPU budget is distributed across two coarse active buckets. A shared scene/state/cardinality driver may still be responsible for both, so this does **not** yet prove two independent bugs.
+**FACT:** among the selected render children, `RG_CORE 0x14021FE20` owns essentially all positive heavy-state growth.
+
+**FACT:** raw `order_count` / `pass_count` can rise with heavy state but are not sufficient to distinguish heavy from smooth.
+
+**FACT:** the measured `sync_flag` path is inactive in the accepted v0.4 run.
+
+**INFERENCE:** the strongest next discriminator is rendergraph pass composition and/or work performed inside individual pass paths.
 
 ## Next step
 
-The project now recurses only inside measured active buckets:
+Do not return to broad static candidate roulette.
 
-1. subdivide `RENDER_ACTIVE` inside `0x1401D72F0` using stable low-overhead boundaries;
-2. subdivide `OTHER` inside `0x1401C77C0` into stable pre/post-render or equivalent subphases;
-3. if the result remains distributed, use differential CPU stack sampling between sustained good and heavy windows;
-4. add state/cardinality counters only inside a measured winning subphase;
-5. map the measured hotspot back to the completed `1.58 ↔ 1.60` counterpart set;
-6. patch only after a concrete millisecond budget exists.
+The next low-overhead experiment keeps all accepted timing/cardinality instrumentation and samples only the passes actually selected by the `RG_CORE` execution-order array, at low rate.
 
-This keeps the investigation runtime-driven instead of returning to visually attractive but potentially irrelevant static deltas.
+Aggregate per sample:
+
+```text
+pass type 1..7 counts
+callback/work-object presence at pass+0x19A8
+raw list count at pass+0x1338
+type-4 item count at pass+0xDB0
+type-7 reference count at pass+0x12D0
+```
+
+Primary comparison: **smooth vs heavy at matched total pass cardinality**.
+
+If one composition/work metric separates the states, recurse only into that pass family/path. If the mix and work counts remain flat while `RG_CORE` still differs by ~3 ms, move to targeted branch timing or differential CPU stack sampling inside `RG_CORE`.
+
+See [`rg-core-runtime-localization.md`](rg-core-runtime-localization.md).
