@@ -2,13 +2,13 @@
 
 Active reverse-engineering investigation of scene-dependent CPU-side stutter in **Euro Truck Simulator 2 1.60.1.7s** using the native DX12 renderer.
 
-> **Status:** the hypothesis-agnostic whole-corpus `1.58.1.4s ↔ 1.60.1.7s` static diff is complete. Runtime follow-up demoted several top-ranked isolated candidates, and coarse main-loop timing now shows that the sustained heavy-state delta is split between **active render-side CPU work** and **other main-loop work**. The measured sleep/spin wait helper does not explain the slowdown.
+> **Status:** the hypothesis-agnostic whole-corpus `1.58.1.4s ↔ 1.60.1.7s` static diff is complete. Runtime phase localization has now narrowed the sustained heavy-state slowdown to **pre-render main-loop work** plus a specific rendergraph execution stage, `RG_CORE = 1.60.1.7s:0x14021FE20`. Raw rendergraph pass/order count can contribute, but matched-cardinality windows prove that count alone is not sufficient: essentially the same number of passes can execute about **2.9 ms slower** in a heavy state. The current discriminator is therefore **pass composition / per-pass work**, not another broad static search.
 
 ## What is being investigated
 
 On the tested system, light scenes can hold roughly **16.67 ms / 60 FPS**, while heavier scene compositions can move into roughly **19–25 ms**. The slowdown is scene-dependent and can sometimes disappear after an unload/ferry/teleport transition without restarting the game.
 
-Earlier runtime work showed that the sustained slowdown is not primarily explained by the previously measured DXGI/fence wait gates. Slow regions mainly contain more work rather than one obvious fixed stall.
+Earlier runtime work showed that the sustained slowdown is not primarily explained by the measured DXGI/fence/wait gates. Slow regions mainly contain more active CPU work rather than one obvious fixed stall.
 
 ## Whole-corpus diff status
 
@@ -35,46 +35,62 @@ Three attractive isolated candidates were demoted by direct runtime evidence:
 
 These results are why the investigation switched from isolated static-candidate probing to runtime phase localization.
 
-## Coarse main-loop localization
+## Runtime localization through v0.4
 
-Current measured chain:
+Measured chain:
 
 ```text
 0x1401C5280  outer loop owner
     -> 0x1401C77C0  main-loop iteration
           -> 0x1401C6CB0  frame-clock / duration bookkeeping
           -> 0x1401D72F0  rendergraph / present coordinator
+                -> 0x14021FE20  RG_CORE / rendergraph execution stage
 ```
 
-`NemoFramePhaseProbe v0.2` additionally measures a nested timing helper:
+`NemoFramePhaseProbe v0.2` separated the nested wait helper `0x14011F730` and showed that it does **not** own the slowdown.
+
+`v0.3` then split the remaining work. In a clean sustained heavy episode:
 
 ```text
-WAIT = 0x14011F730
+                              RECOVERED   HEAVY      DELTA
+LOOP                           16.672 ms   19.735 ms  +3.063 ms
+RENDER_ACTIVE                   9.983 ms   11.593 ms  +1.610 ms
+PRE_RENDER_OTHER                6.285 ms    7.752 ms  +1.467 ms
+POST_RENDER_OTHER               0.381 ms    0.380 ms  ~0
+RG_CORE                         6.271 ms    8.964 ms  +2.693 ms
 ```
 
-and derives:
+Among the selected immediate render children, essentially all positive heavy-state growth localized to **`RG_CORE 0x14021FE20`**. The non-render growth localized to **pre-render work**, not post-render cleanup.
+
+`v0.4` sampled rendergraph cardinality at `RG_CORE` entry with no new target detours. Across nine clean heavy windows:
 
 ```text
-RENDER_ACTIVE = RENDER - WAIT
-OTHER         = LOOP - PACE - RENDER
-CPU_ACTIVE    = OTHER + RENDER_ACTIVE + PACE
+                              GOOD        HEAVY       DELTA
+LOOP                          16.689 ms   20.116 ms   +3.427 ms
+RENDER_ACTIVE                 10.123 ms   12.071 ms   +1.949 ms
+PRE_RENDER_OTHER               6.177 ms    7.602 ms   +1.425 ms
+RG_CORE                        5.896 ms    9.417 ms   +3.521 ms
+order_count                  157.5       183.5       +26.0
+pass_count                   158.5       184.5       +26.0
 ```
 
-Across clean ordinary-gameplay good (`LOOP <= 17 ms`) versus heavy (`LOOP >= 19 ms`) windows:
+Two heavy episodes showed large count jumps (~145 → ~190+), so pass cardinality can contribute.
+
+However, matched-cardinality windows are decisive:
 
 ```text
-             GOOD       HEAVY      DELTA
-LOOP         16.683 ms  20.358 ms  +3.675 ms
-RENDER_ACTIVE11.404 ms  13.507 ms  +2.103 ms
-OTHER         5.253 ms   6.840 ms  +1.586 ms
-WAIT          0.024 ms   0.009 ms  -0.015 ms / loop
+                              SMOOTH      HEAVY
+LOOP                          16.696 ms   19.851 ms
+RG_CORE                        6.253 ms    9.161 ms
+order_count                  192.88      191.16
+pass_count                   193.88      192.16
 ```
 
-The sleep/spin helper is conditional and sparse (`2,092` calls vs `33,339` main-loop calls) and contributes only tens of microseconds per normal gameplay loop.
+At essentially the **same pass count**, `RG_CORE` can be about **+2.91 ms slower**. The synchronization flag was never active in the run (`0 / 86,942`).
 
-**Current coarse split:** roughly **57% active render-side work / 43% other main-loop work**.
+**Current conclusion:** raw pass count is a contributor in some episodes, but not the root discriminator. The next question is which pass types / per-pass work differ at the same total cardinality.
 
-See [`docs/runtime-phase-localization.md`](docs/runtime-phase-localization.md).
+See [`docs/runtime-phase-localization.md`](docs/runtime-phase-localization.md) and [`docs/rg-core-runtime-localization.md`](docs/rg-core-runtime-localization.md).
 
 ## Descriptor/root-binding branch: still real, not the whole theory
 
@@ -90,22 +106,22 @@ Do not return to broad static candidate roulette or broad per-D3D-call tracing.
 
 Current order:
 
-1. subdivide `RENDER_ACTIVE` inside `0x1401D72F0` around stable low-overhead boundaries;
-2. subdivide `OTHER` inside `0x1401C77C0` into stable pre/post-render or equivalent subphases;
-3. if the cost remains distributed, compare differential CPU stack samples between sustained good and heavy windows;
-4. add state/cardinality counters only inside the measured winning subphase;
-5. map the measured hotspot back to the completed `1.58 ↔ 1.60` counterpart set;
-6. patch only after a measured millisecond budget exists.
+1. compare smooth vs heavy windows at **matched rendergraph cardinality**;
+2. sample the `RG_CORE` execution-order-selected passes at low rate;
+3. aggregate pass types `1..7` and a few exact per-pass work-count fields already consumed by `RG_CORE`;
+4. if one pass family/work count separates smooth from heavy, recurse only into that path;
+5. if pass mix/work counts stay flat, move to branch timing or differential CPU stack sampling inside `RG_CORE`;
+6. patch only after a concrete millisecond budget is localized.
 
 ## Help wanted
 
 Useful outside contributions are welcome, especially:
 
 - independent reproduction of the scene-dependent slowdown
-- review of the current main-loop / render-active split
-- low-overhead Windows x64 stack-sampling ideas suitable for good-vs-heavy differential analysis
+- review of the `PRE_RENDER_OTHER` + `RG_CORE` localization
+- interpretation of rendergraph pass-type composition around `0x14021FE20`
+- low-overhead Windows x64 stack-sampling ideas suitable for matched-cardinality smooth-vs-heavy analysis
 - corrections to build-specific function mappings
-- alternative explanations for a shared scene/state driver increasing both `RENDER_ACTIVE` and `OTHER`
 
 Please keep **FACT / INFERENCE / HYPOTHESIS** separate and identify the exact build for every address.
 
@@ -114,7 +130,8 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 ## Start here
 
 - [`docs/current-findings.md`](docs/current-findings.md) — current technical state
-- [`docs/runtime-phase-localization.md`](docs/runtime-phase-localization.md) — latest runtime phase results
+- [`docs/runtime-phase-localization.md`](docs/runtime-phase-localization.md) — runtime phase results
+- [`docs/rg-core-runtime-localization.md`](docs/rg-core-runtime-localization.md) — RG_CORE and cardinality results
 - [`docs/global-diff-summary.md`](docs/global-diff-summary.md) — completed whole-corpus 1.58 ↔ 1.60 comparison
 - [`docs/function-map.md`](docs/function-map.md) — build-specific function map
 - [`docs/shader-profile-architecture-delta.md`](docs/shader-profile-architecture-delta.md) — descriptor/root-binding branch
