@@ -157,13 +157,19 @@ This is negative evidence against the proposed practical six-shader-tuple/profil
 
 ## Current place in the investigation
 
-The completed global diff now ranks the following above or alongside this local branch:
+This branch remains a confirmed architectural change and a validated optimization target, but runtime localization has since moved much deeper into the rendergraph execution path.
 
-1. repeated `render_queue_set_t` ownership/refcount delta in a conserved frame-render path
-2. broader p3mem migration in active runtime paths
-3. this shader-profile / descriptor / root-binding architecture
-4. `r_proto` lazy mask resolution as a possible streaming/state component
+The current measured chain is summarized in [`current-findings.md`](current-findings.md). The active render-side leaf is currently downstream of:
 
-The next runtime experiment is therefore **not** another broad profile-aware D3D probe. It is a narrow counter/timing discriminator around `1.60.1.7s:0x14154AAB0`.
+```text
+RG_CORE
+  -> T1 helper
+    -> pass callback
+      -> nested winner
+        -> RQ_ONE
+          -> HEAD_DISPATCH
+```
 
-Static evidence and runtime structural ratios should continue to be reported separately from causal claims.
+The descriptor/root-binding work should therefore be treated as a **secondary measured optimization branch**, not as the project's current root-cause candidate.
+
+The public rule remains: static architecture differences and runtime structural ratios are evidence, but causal ranking comes from measured frame-budget ownership.
