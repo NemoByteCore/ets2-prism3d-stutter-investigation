@@ -2,7 +2,7 @@
 
 Active reverse-engineering investigation of scene-dependent CPU-side stutter in **Euro Truck Simulator 2 1.60.1.7s** using the native DX12 renderer.
 
-> **Status:** the whole-corpus `1.58.1.4s ↔ 1.60.1.7s` static diff is complete. Runtime localization has narrowed sustained heavy-state CPU cost to **pre-render main-loop work** plus `RG_CORE = 1.60.1.7s:0x14021FE20`. `v0.4` proved that raw rendergraph cardinality can contribute but is not sufficient. `v0.5` went further: matched windows with effectively identical pass count **and coarse pass composition/work counters** still show `RG_CORE` becoming roughly **3–5 ms more expensive**. The next discriminator is sampled timing of exact execution branches inside RG_CORE, not more counting.
+> **Status:** the whole-corpus `1.58.1.4s ↔ 1.60.1.7s` static diff is complete. Runtime localization has narrowed sustained heavy-state CPU cost to **pre-render main-loop work** plus `RG_CORE = 1.60.1.7s:0x14021FE20`. `v0.4` and `v0.5` showed that neither raw rendergraph cardinality nor coarse pass composition/work counters are sufficient. `v0.6` now localizes a large fraction of the remaining RG_CORE delta to the **type-1 helper `1.60.1.7s:0x14021F560`**: at exact matched cardinality and effectively unchanged type-1 call count, sampled type-1 per-call cost rises sharply. The next discriminator recurses inside that helper.
 
 ## What is being investigated
 
@@ -114,19 +114,27 @@ Another exact `158 / 159` matched pair has `RG_CORE` at roughly **5.13 ms smooth
 
 See [`docs/rg-core-runtime-localization.md`](docs/rg-core-runtime-localization.md).
 
-## Current next step — v0.6 branch timing
+## v0.6 result — type-1 helper wins
 
-The next runtime probe keeps accepted timing/cardinality and removes the v0.5 mix scan. It samples every 16th execution of three exact direct paths inside RG_CORE:
+At exact matched order/pass cardinality `168 / 169`:
 
 ```text
-0x14021F560  type-1 helper
-0x14021F780  type-4 helper
-0x1402DE540  type-7 per-reference helper
+                              SMOOTH      HEAVY
+RG_CORE                        5.225 ms    8.196 ms
+type-1 calls / RG_CORE        ~143.9      ~144.0
+type-1 sample avg              ~16 us      ~32 us
+type-1 estimated/RG_CORE       2.373 ms     4.650 ms
+type-4 estimated/RG_CORE       0.004 ms     0.005 ms
+type-7 estimated/RG_CORE       0.000 ms     0.000 ms
 ```
 
-These timings remain nested inside RG_CORE and are not added to RENDER child accounting.
+The type-1 path explains about **2.28 ms of the 2.97 ms RG_CORE increase** in this exact pair, while type-4/type-7 timing is effectively flat. The same direction repeats across several other exact-cardinality groups.
 
-If type 1 owns the smooth-vs-heavy difference, the investigation recurses into its callback/device-facing path. If type 4 or type 7 wins, only that branch is expanded. If none wins, the remaining RG_CORE body/tail and type-2/3/5/6 work becomes the next residual target or stack-sampling scope.
+## Current next step — recurse inside type 1
+
+The next runtime discriminator keeps the accepted parent and type-1 timing, then aligns internal measurements to the same sampled type-1 calls. It separates the device-facing +0x208 call, the pass-specific callback, pre-tail work and a derived final +0x108 tail cost.
+
+No behavior patch is justified yet.
 
 ## Descriptor/root-binding branch
 
