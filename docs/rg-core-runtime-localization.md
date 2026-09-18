@@ -45,7 +45,7 @@ The measured WAIT helper is not the owner of this increase.
 | Pass callback | site `0x14021F73C` | T1 `206 -> 603 qpc`, callback `200 -> 596 qpc` | T1 variation is almost entirely callback time |
 | Nested implementation | `0x1413BD3F0 -> 0x1413BB140` | Estimated contribution `1.421 -> 4.661 ms` while samples fall `649 -> 583` | Dominant callback implementation gets slower per call |
 | Winner child | `RQ_ONE 0x14154C9F0` | `1.682 -> 4.535 ms` in exact `160/161` comparison | Dominant child of winner |
-| RQ_ONE child | `HEAD_DISPATCH 0x14154CF60` | ~99.84% of sampled RQ_ONE time | Current measured leaf |
+| RQ_ONE child | `HEAD_DISPATCH 0x14154CF60` | ~99.84% of sampled RQ_ONE time | Collapses onto no-split path |\n| HEAD path | `0x14154CFA7 -> 0x1402D8D20` | 32,359 no-split samples, 0 range samples, negligible residual | Current measured leaf |
 
 ## Why pass count is not enough
 
@@ -175,31 +175,43 @@ The current `HEAD_DISPATCH` counterpart is the same size in both builds (`491` b
 
 ## Current discriminator
 
-`HEAD_DISPATCH` contains two normal direct calls to the same downstream function:
+Splitting HEAD_DISPATCH by path produced:
 
 ```text
-NOSPLIT  1.60.1.7s:0x14154CFA7 -> 0x1402D8D20
-RANGE    1.60.1.7s:0x14154D048 -> 0x1402D8D20
+HEAD sampled                32,359
+NOSPLIT calls               32,359
+RANGE calls                      0
+HEAD residual_qpc           86,723
 ```
 
-The active experiment separates these two callsites and the residual body.
-
-Decision:
+Exact `143/144` cardinality:
 
 ```text
-one path dominates and slows per call
-  -> recurse into that path/shared target
-
-mix shifts while per-call cost is stable
-  -> composition effect
-
-both calls slow similarly
-  -> recurse into shared 0x1402D8D20
-
-residual grows instead
-  -> split HEAD_DISPATCH body
+HEAD_DISPATCH             2.585 -> 3.869 ms
+NOSPLIT_DISPATCH          2.578 -> 3.863 ms
+samples                     459 -> 407
+avg qpc                     958 -> 1512
+residual                  ~0.007 ms flat
 ```
 
+Across normal windows:
+
+```text
+corr(HEAD_DISPATCH, NOSPLIT_DISPATCH) ~= 0.99999924
+```
+
+**FACT:** the ranged path is absent from the accepted sampled population.
+
+**FACT:** the no-split path inherits essentially all measured HEAD_DISPATCH cost and variation.
+
+The current leaf is therefore the shared downstream implementation:
+
+```text
+1.60.1.7s:0x1402D8D20
+1.58.1.4s:0x1401EC530
+```
+
+The next discriminator splits direct children inside `0x1402D8D20`; any remaining indirect device call/body work stays visible as residual.
 No behavior patch is justified yet.
 
 ## Secondary measured branches
