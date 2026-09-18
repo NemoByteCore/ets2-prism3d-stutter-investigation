@@ -1,272 +1,151 @@
 # Experiments
 
-Updated: **2026-09-16**
+Updated: **2026-09-18**
 
-## Confirmed useful optimization
+This file keeps the experiments that still matter to the current interpretation. Probe-by-probe chronology is intentionally omitted; old version numbers are not useful unless they changed the conclusion.
 
-### NemoDX12SamplerAllocReuse v0.2 / v0.3
+## Current runtime localization
 
-**Idea:** reuse same-frame sampler tables before materializing another full fixed-profile sampler allocation.
-
-**v0.2 observed:**
+The active runtime strategy is:
 
 ```text
-sampler_alloc_provisional = 125,772,004
-unique_tables             =   5,089,396
-duplicate_tables          = 108,312,238
-zero_copy_tables          =  12,370,370
-requested_slots_original  = 2,251,985,241
-allocated_slots_real      =    96,277,760
-avoided_slots             = 2,156,696,505
-sampler_copy_calls_seen   =   247,221,488
-copy_calls_skipped        =   235,147,658
+broad frame phase
+  -> measured owner
+    -> sampled child timing
+      -> matched-cardinality comparison
+        -> recurse only into the measured owner
 ```
 
-Derived:
+The current render-side chain is:
 
-- ~86.12% duplicate tables
-- ~9.84% zero-copy tables
-- ~4.05% real nonzero unique tables
-- ~95.77% requested sampler slots avoided
-- ~95.12% sampler copy calls skipped
+```text
+RG_CORE
+  -> T1 helper
+    -> pass callback
+      -> nested winner
+        -> RQ_ONE
+          -> HEAD_DISPATCH
+            -> 0x1402D8D20
+```
 
-All safety/error counters were zero.
+Current question: separate the no-split and ranged callsites from `HEAD_DISPATCH` to the shared downstream target.
 
-A later v0.3 run reproduced approximately:
+See [`rg-core-runtime-localization.md`](rg-core-runtime-localization.md).
 
-- ~95.18% requested sampler slots avoided
-- ~94.49% sampler copy calls skipped
-- all safety/error counters zero
+## Confirmed useful optimization: sampler-table reuse
 
-**Interpretation:** fixed-profile sampler reservation/copy pressure is real and safely reducible.
+The mapped 1.60 descriptor/root-binding architecture reserves fixed profile capacity well above actual binding demand.
 
-**Important limit:** the broader sustained heavy-scene slowdown can still occur after this pressure is strongly reduced. This is therefore a validated optimization component, not the complete root cause or complete fix.
+A safe sampler-table reuse experiment observed roughly:
+
+```text
+requested sampler slots avoided    ~95%
+sampler copy calls skipped         ~95%
+safety/error counters                 0
+```
+
+This confirms a real optimization opportunity.
+
+**Limit:** the broader sustained heavy-scene slowdown still occurs after this pressure is strongly reduced.
+
+**Status:** useful optimization component, not the complete root cause.
 
 ## Broad structural profiler
 
-### NemoShaderProfileProbe v0.2
+A profile-aware D3D12 structural probe found:
 
-This broad probe was useful structurally but too intrusive for unbiased absolute frametime attribution because it wrapped tens of thousands of direct D3D12 calls per active frame.
+```text
+reserved resource capacity / actual demand  ~7.62x median
+reserved sampler capacity / actual demand   ~8.34x median
+material profile share                      ~87% of active draws
+typical sampler reservation                 ~18.0 slots/draw
+typical actual sampler bindings             ~2.12/draw
+shader tuple/profile conflicts              0 in the measured audit
+```
 
-Useful structural observations:
+The design wrapped too many hot D3D calls to be trusted for absolute performance attribution.
 
-- reserved resource capacity / actual resource-layout demand: ~7.62x median
-- reserved sampler capacity / actual sampler demand: ~8.34x median
-- `material` profile: ~87% of active-gameplay draws in the capture
-- typical sampler reservation: ~18.0 slots/draw vs ~2.12 actual sampler bindings/draw
-- shader tuple/profile audit: 524 requests, 377 unique tuples, 0 conflicts
+**Status:** retain structural observations; do not repeat this broad hook design for timing.
 
-**Status:** retain the structural evidence; do not repeat this design as a broad performance profiler.
+## Runtime-demoted static candidates
 
-## Runtime discrimination after the whole-corpus diff
-
-### NemoRenderQueueProbe v0.2
-
-Target:
+### `render_queue_set_t` copy helper
 
 ```text
 1.60.1.7s:0x14154AAB0
+14 direct executions / 24,798 rendered frames
 ```
 
-This was the strongest new steady-state static candidate after the whole-corpus diff.
+**Status:** direct sustained-cost theory demoted.
 
-Observed direct-call totals:
-
-```text
-0x013C2A22 = 12
-0x013C3289 = 1
-0x013C329D = 1
-0x0145CF47 = 0
-0x0154E4C4 = 0
-
-total = 14 calls
-```
-
-The run contained `24,798` rendered frames.
-
-**Interpretation:** the direct execution frequency is far too low to explain a sustained multi-millisecond-per-frame regression.
-
-**Status:** direct-cost theory strongly demoted. Do not add deeper timing without new evidence.
-
-### NemoRProtoProbe v0.1
-
-Proposed target:
+### `r_proto` proposed boundary
 
 ```text
 1.60.1.7s:0x1413C1470
 ```
 
-The whole executable contained no direct `E8 rel32` calls to the target, so the probe intentionally refused to install instrumentation.
+No direct `E8 rel32` callsites were found at the proposed boundary.
 
-Follow-up harvested callgraph inspection also found no incoming direct-call edge to the same boundary.
+**Status:** do not repeat the same direct-call probe without new reachability evidence.
 
-**Interpretation:** this is a structural reachability negative for the proposed hook boundary, not a runtime-frequency measurement of all related `r_proto` behavior.
-
-**Status:** do not repeat direct-call probing without new xref/indirect-reachability evidence.
-
-### NemoTrafficNeighborProbe v0.1
-
-Target:
+### `traffic_trajectory_t::update_neighbors_bits`
 
 ```text
-traffic_trajectory_t::update_neighbors_bits
 1.60.1.7s:0x1408DC510
+85 total calls
 ```
 
-Four direct callsites were validated and instrumented.
+A sustained heavy-state onset occurred across a long interval with no calls to the target.
+
+**Status:** direct sustained-cost theory demoted.
+
+## Descriptor/resource experiments that should not be repeated as implemented
+
+### Individual resource-descriptor reuse
+
+Large redundancy was observed, but intercepting/buffering enormous numbers of individual writes made the experiment substantially slower.
+
+**Conclusion:** the implementation is rejected; the existence of redundancy is not.
+
+### Full descriptor-builder memoization
 
 Observed:
-
-```text
-total calls = 85
-ordinary gameplay calls ≈ 55
-shutdown/unload-adjacent burst = 30
-```
-
-The same run captured a clean natural transition:
-
-```text
-baseline weighted mean ≈ 16.775 ms/frame
-heavy weighted mean    ≈ 22.268 ms/frame
-sustained delta        ≈ +5.49 ms/frame
-```
-
-There was an approximately `42.17 s` call-free interval centered on the heavy-state onset.
-
-**Interpretation:** direct execution cost at this target cannot plausibly own the sustained frame budget. The later higher call rate is more likely correlated scene activity than direct causality.
-
-**Status:** strongly demoted as a sustained direct-cost theory.
-
-## Current runtime-first localization
-
-### NemoFramePhaseProbe v0.1
-
-Recovered main-loop chain:
-
-```text
-0x1401C5280  outer loop owner
-    -> 0x1401C77C0  main-loop iteration
-          -> 0x1401C6CB0  frame-clock / duration bookkeeping
-          -> 0x1401D72F0  rendergraph / present coordinator
-```
-
-Measured buckets:
-
-```text
-LOOP   = duration of 0x1401C77C0
-PACE   = nested duration of 0x1401C6CB0
-RENDER = nested duration of 0x1401D72F0
-OTHER  = LOOP - PACE - RENDER
-```
-
-Final call counts were sane:
-
-```text
-LOOP calls   = 29,590
-PACE calls   = 29,590
-RENDER calls = 29,588
-bad_end      = 0
-thread mismatch = 0
-```
-
-Two natural good→heavy transitions produced similar deltas:
-
-```text
-transition A:
-LOOP   +4.116 ms
-RENDER +1.641 ms
-OTHER  +2.475 ms
-
-transition B:
-LOOP   +3.745 ms
-RENDER +2.007 ms
-OTHER  +1.738 ms
-```
-
-`PACE` remained around `~0.001 ms/iteration`.
-
-**Interpretation:** `PACE` is not the owner. A repeatable `~1.7–2.5 ms` part of the heavy-state increase lands in `OTHER`, outside the broad rendergraph/present bucket.
-
-**Important caveat:** `RENDER` includes a nested deliberate frame-time wait helper, so its `+1.6–2.0 ms` change is not yet equivalent to extra active renderer work.
-
-### NemoFramePhaseProbe v0.2 — current experiment
-
-Nested wait helper identified at:
-
-```text
-1.60.1.7s:0x14011F730
-```
-
-The helper uses `Sleep()` followed by a short spin phase.
-
-v0.2 measures that wait separately and derives:
-
-```text
-RENDER_ACTIVE = RENDER - WAIT
-OTHER         = LOOP - PACE - RENDER
-CPU_ACTIVE    = OTHER + RENDER_ACTIVE + PACE
-```
-
-Decision rule:
-
-- `WAIT` decreases while `RENDER_ACTIVE` stays roughly flat -> extra CPU work is primarily elsewhere and consumes pacing headroom;
-- `RENDER_ACTIVE` also rises materially -> missing budget is split between active render-side work and `OTHER`;
-- neither split explains enough -> differential CPU stack sampling good vs heavy.
-
-See [`runtime-phase-localization.md`](runtime-phase-localization.md).
-
-## Descriptor/resource experiments
-
-### Resource Descriptor Reuse v0.5
-
-Observed:
-
-- ~47.2M hits
-- ~9.95M misses
-- ~112.2M writes skipped
-- frametime degraded to ~28–30 ms
-
-**Interpretation:** redundancy exists, but intercepting/buffering enormous numbers of individual writes made this implementation more expensive than the work removed.
-
-**Status:** implementation rejected; underlying redundancy remains relevant.
-
-### Full descriptor-builder memo v0.2
 
 ```text
 memo_hits   = 0
 memo_misses = 35,170,169
 ```
 
-**Interpretation:** complete draw/bundle state is too dynamic for this form of memoization.
+**Conclusion:** complete draw/bundle state is too dynamic for this memoization shape.
 
-**Status:** rejected.
+### Resource-table reuse with the old decoder
 
-### Resource table reuse v0.3
+The decoder rejected the correct path because a validation rule was too aggressive.
 
-The decoder skipped the correct path because validation of `set_count > root_set_count` was too aggressive.
+**Conclusion:** invalid as a broad negative result. Do not cite it as proof that useful resource-table redundancy is absent.
 
-**Status:** invalid as a broad negative result. Do not cite it as proof that useful resource-table redundancy is absent.
+## Whole-corpus static comparison
 
-## Completed whole-corpus static phase
-
-A hypothesis-agnostic `1.58.1.4s ↔ 1.60.1.7s` corpus diff is complete.
+The hypothesis-agnostic `1.58.1.4s ↔ 1.60.1.7s` corpus diff remains the static map:
 
 ```text
-confirmed counterpart pairs: 58,589
-materially changed confirmed pairs: 9,308
-strong anchored 1.60-only: 597
-strong anchored 1.58-only: 375
-ambiguous unmatched regions: 3,370
+confirmed counterpart pairs:        58,589
+materially changed confirmed pairs:  9,308
+strong anchored 1.60-only:             597
+strong anchored 1.58-only:             375
+ambiguous unmatched regions:          3,370
 ```
 
-Static ranking remains useful for mapping measured runtime hotspots, but recent experiments show why it is no longer used to choose the next isolated target by itself.
+Static ranking is no longer used to pick the next isolated target by appearance alone.
 
 ## Experiment policy
 
-- one significant variable at a time
-- ordinary gameplay in one session; no requirement for hand-picked benchmark saves
-- correlate against actual rendered frametime, not telemetry callback count
-- prefer counters before timing, timing before patching
-- if a candidate measures negligible frequency/cost, demote it immediately
-- avoid broad per-D3D-call tracing
-- after repeated isolated negatives, localize the owning runtime phase before choosing another leaf function
+- one significant variable at a time;
+- ordinary gameplay in one session is acceptable;
+- correlate against actual rendered frametime, not telemetry callback count;
+- prefer counters before timing, timing before patching;
+- use sampled/aggregate timing in hot paths;
+- matched-cardinality comparisons are preferred when workload count can vary;
+- demote candidates immediately when runtime frequency/cost is negligible;
+- avoid broad per-D3D-call tracing when a narrow counter can answer the question;
+- finish one measured branch before opening secondary branches.
