@@ -2,7 +2,7 @@
 
 Active reverse-engineering investigation of scene-dependent CPU-side stutter in **Euro Truck Simulator 2 1.60.1.7s** using the native DX12 renderer.
 
-> **Status:** runtime localization has narrowed the render-side slowdown to `RQ_ONE = 1.60.1.7s:0x14154C9F0`, reached through `RG_CORE -> T1_HELPER -> pass callback -> nested winner 0x1413BB140`. In `v0.10`, exact matched `160/161` cardinality shows the winner rising `2.286 -> 5.743 ms`; `RQ_ONE` alone rises `1.682 -> 4.535 ms` while its sampled call count falls. The next discriminator splits the four normal direct callsites inside `RQ_ONE`.
+> **Status:** runtime localization has narrowed the render-side slowdown to `HEAD_DISPATCH = 1.60.1.7s:0x14154CF60`, reached through `RG_CORE -> T1_HELPER -> pass callback -> nested winner -> RQ_ONE`. In `v0.11`, HEAD_DISPATCH accounts for about **99.84%** of sampled RQ_ONE time; at exact `156/157` cardinality RQ_ONE rises `1.855 -> 4.002 ms` and HEAD_DISPATCH rises `1.850 -> 3.997 ms` while sampled call count falls. The next discriminator splits its two path-specific calls to `0x1402D8D20`.
 
 ## What is being investigated
 
@@ -130,43 +130,58 @@ type-7 estimated/RG_CORE       0.000 ms     0.000 ms
 
 The type-1 path explains about **2.28 ms of the 2.97 ms RG_CORE increase** in this exact pair, while type-4/type-7 timing is effectively flat. The same direction repeats across several other exact-cardinality groups.
 
-## v0.10 result — RQ_ONE is the dominant concrete child
+## v0.11 result — RQ_ONE collapses onto HEAD_DISPATCH
 
-The substantive winner `0x1413BB140` was split into seven direct children plus residual. At exact matched `order/pass = 160/161`:
+v0.11 split the four selected direct callsites inside `RQ_ONE = 0x14154C9F0`.
 
-```text
-                              SMOOTH      HIGH-COST
-RG_CORE                        6.925 ms   11.358 ms
-winner 0x1413BB140             2.286 ms    5.743 ms
-RQ_ONE 0x14154C9F0            1.682 ms    4.535 ms
-RQ_PREP 0x14154C370           0.448 ms    1.023 ms
-winner residual                0.022 ms    0.022 ms
-```
-
-The `RQ_ONE` contribution rises by about **2.85 ms** while its sampled call count falls `496 -> 352`; average sampled duration rises `635 -> 1940 qpc`.
-
-Across normal windows, winner cost and `RQ_ONE` cost correlate at about `0.998`.
-
-**FACT:** `RQ_ONE = 0x14154C9F0` is the dominant measured owner inside the winning callback implementation. `RQ_PREP` is a secondary contributor; winner-body residual is negligible.
-
-Static mapping identifies a close 1.58 counterpart:
+Across the full run:
 
 ```text
-1.60 0x14154C9F0  <->  1.58 0x1413D7170
+RQ_ONE parent total_qpc      24,363,328
+HEAD_DISPATCH total_qpc      24,324,287
+VIEW_UPDATE calls                     0
+CMD_ALLOC calls                       0
+INNER_DISPATCH calls                  0
+RQ_ONE residual_qpc              39,041
 ```
 
-## Current next step — split RQ_ONE
+So HEAD_DISPATCH accounts for about **99.84%** of measured sampled RQ_ONE time.
 
-The next probe separately times four normal direct callsites inside `0x14154C9F0`:
+At exact matched `order/pass = 156/157`:
 
 ```text
-HEAD_DISPATCH_154CF60
-VIEW_UPDATE_2158E0
-CMD_ALLOC_281C80
-INNER_DISPATCH_154CF60
+                              LOW-COST    HIGH-COST
+RQ_ONE parent                  1.855 ms    4.002 ms
+HEAD_DISPATCH                  1.850 ms    3.997 ms
+HEAD samples                     398         386
+HEAD avg qpc                     842        1727
+RQ_ONE residual                0.005 ms    0.005 ms
 ```
 
-and reports the remaining RQ_ONE residual. This should distinguish dispatch cost from view/state update, command allocation, or body work.
+Across normal windows, `corr(RQ_ONE parent, HEAD_DISPATCH) ≈ 0.9999998`.
+
+**FACT:** the accepted sampled RQ_ONE path is effectively entirely `HEAD_DISPATCH = 0x14154CF60`.
+
+**FACT:** its slowdown is per-call, not increased invocation count.
+
+Static mapping:
+
+```text
+1.60 0x14154CF60  <->  1.58 0x1413D7700
+```
+
+Both are 491-byte functions. The 1.60 function has two normal direct calls to `0x1402D8D20`, corresponding to the no-split and ranged paths.
+
+## Current next step — split HEAD_DISPATCH
+
+The next probe times these two callsites separately:
+
+```text
+0x14154CFA7 -> 0x1402D8D20   no-split path
+0x14154D048 -> 0x1402D8D20   ranged path
+```
+
+and reports HEAD_DISPATCH residual.
 
 No behavior patch is justified yet.
 
