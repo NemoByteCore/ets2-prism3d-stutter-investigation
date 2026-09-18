@@ -331,17 +331,64 @@ The close static counterpart is:
 1.58 0x1413D7170, size 1417
 ```
 
-## v0.11 direction
+## v0.11 — RQ_ONE collapses onto HEAD_DISPATCH
 
-The next probe preserves the accepted chain and times four normal direct callsites inside `RQ_ONE`:
+v0.11 split the four selected normal direct callsites inside `RQ_ONE = 0x14154C9F0`.
+
+Full-run sampled totals:
 
 ```text
-0x14154CA29 -> 0x14154CF60   head dispatch
-0x14154CC1B -> 0x1402158E0   view/state update
-0x14154CDAE -> 0x140281C80   command allocation
-0x14154CDE9 -> 0x14154CF60   inner per-entry dispatch
+RQ_ONE parent total_qpc      24,363,328
+HEAD_DISPATCH total_qpc      24,324,287
+VIEW_UPDATE calls                     0
+CMD_ALLOC calls                       0
+INNER_DISPATCH calls                  0
+RQ_ONE residual_qpc              39,041
 ```
 
-The two `0x14154CF60` sites stay separate because they occur at different structural positions.
+HEAD_DISPATCH accounts for about **99.84%** of sampled RQ_ONE time.
+
+Exact matched `order/pass = 156/157`:
+
+```text
+                              LOW-COST    HIGH-COST    DELTA
+RQ_ONE parent                  1.855 ms    4.002 ms    +2.147
+HEAD_DISPATCH                  1.850 ms    3.997 ms    +2.147
+HEAD samples                     398         386
+HEAD avg qpc                     842        1727
+RQ_ONE residual                0.005 ms    0.005 ms    ~0
+```
+
+Across normal windows:
+
+```text
+corr(RQ_ONE parent, HEAD_DISPATCH) ≈ 0.99999977
+```
+
+**FACT:** the accepted sampled RQ_ONE cost is effectively entirely inside `HEAD_DISPATCH = 0x14154CF60`.
+
+**FACT:** the slowdown is per-call; sampled count can fall while duration rises sharply.
+
+**FACT:** the other three selected RQ_ONE callsites are not active on this sampled path.
+
+Static mapping:
+
+```text
+1.60 HEAD_DISPATCH 0x14154CF60, size 491
+1.58 HEAD_DISPATCH 0x1413D7700, size 491
+```
+
+The 1.60 function contains two normal direct dispatch sites:
+
+```text
+0x14154CFA7 -> 0x1402D8D20
+0x14154D048 -> 0x1402D8D20
+```
+
+The static 1.58 downstream counterpart is `0x1401EC530`.
+
+## v0.12 direction
+
+The next probe times the two `0x1402D8D20` callsites separately while an already-sampled HEAD_DISPATCH is active and reports HEAD_DISPATCH residual. This distinguishes no-split vs ranged-path composition from shared-target per-call slowdown.
 
 No behavior patch is justified yet.
