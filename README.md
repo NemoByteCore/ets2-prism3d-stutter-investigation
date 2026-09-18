@@ -2,7 +2,7 @@
 
 Active reverse-engineering investigation of scene-dependent CPU-side stutter in **Euro Truck Simulator 2 1.60.1.7s** using the native DX12 renderer.
 
-> **Status:** the whole-corpus `1.58.1.4s ↔ 1.60.1.7s` static diff is complete. Runtime localization has narrowed the render-side slowdown from `RG_CORE = 1.60.1.7s:0x14021FE20` to the **type-1 helper `0x14021F560`**, then to its pass callback at `0x14021F73C`. `v0.8` reproduced sustained ~19–24 ms heavy windows and found that all **107,739 sampled callbacks** entered one outer thunk, `0x140226A50`; exact matched `159/160` cardinality showed `RG_CORE 5.265 → 11.121 ms` while callback timing rose `203 → 597 qpc`. Static inspection shows that target is only a nested-object/vtable dispatch thunk, so the next discriminator resolves the final implementation behind it.
+> **Status:** the whole-corpus `1.58.1.4s ↔ 1.60.1.7s` static diff is complete. Runtime localization has narrowed the render-side slowdown from `RG_CORE = 0x14021FE20` to type-1 helper `0x14021F560`, its pass callback `0x14021F73C`, and now a dominant nested implementation path. `v0.9` shows that final target `0x1413BD3F0 -> JMP 0x1413BB140` accounts for about **60.6% of sampled T1 time** and tracks T1 cost with `r ≈ 0.973`; at exact `144/145` cardinality its estimated contribution rises `1.421 → 4.661 ms` while sampled call count falls slightly. The next discriminator splits the direct children of `0x1413BB140`.
 
 ## What is being investigated
 
@@ -130,30 +130,33 @@ type-7 estimated/RG_CORE       0.000 ms     0.000 ms
 
 The type-1 path explains about **2.28 ms of the 2.97 ms RG_CORE increase** in this exact pair, while type-4/type-7 timing is effectively flat. The same direction repeats across several other exact-cardinality groups.
 
-## Current next step — resolve the implementation behind the callback thunk
+## v0.9 result — dominant nested implementation identified
 
-`v0.7.1` showed that essentially all sampled type-1 cost variation is inside the pass callback at `0x14021F73C`.
-
-`v0.8` then found exactly one outer callback target across 107,739 samples:
+v0.9 resolved the final nested callback implementations. The dominant target is:
 
 ```text
-1.60.1.7s:0x140226A50
-MOV RCX,[RCX+0x110]
-MOV RAX,[RCX]
-JMP qword ptr [RAX+0x8]
+1.60.1.7s:0x1413BD3F0
+  -> JMP 0x1413BB140
 ```
 
-This is a dispatch thunk rather than the substantive implementation.
-
-The next discriminator resolves:
+Across the run it accounts for about **60.6%** of sampled T1 time. At exact `order/pass = 144/145`:
 
 ```text
-inner      = *(callback_object + 0x110)
-inner_vtbl = *inner
-final      = *(inner_vtbl + 0x8)
+                              LOW-COST    HIGH-COST
+RG_CORE                        4.590 ms    8.580 ms
+type-1 estimated/RG_CORE       2.245 ms    6.096 ms
+0x1413BD3F0 estimated/RG_CORE  1.421 ms    4.661 ms
+winner sampled calls             649         583
+winner sample avg qpc             410        1354
 ```
 
-on the same sampled T1 calls and buckets the already-measured callback duration by that final target.
+The winner becomes much more expensive per call rather than simply more frequent.
+
+Static mapping identifies the substantive function as `0x1413BB140` (936 bytes), with a close 1.58 counterpart at `0x14120D6B0` (940 bytes). A render-queue data-layout change is visible between the versions, including item stride `0x48 → 0x58`, but this remains a **static observation**, not a causal conclusion.
+
+## Current next step — split the substantive winner
+
+The next probe times seven direct child calls inside `0x1413BB140` and separately measures the residual body cost, only for already-sampled T1 calls that resolve to the winning target.
 
 No behavior patch is justified yet.
 
