@@ -57,7 +57,8 @@ RG_CORE 0x14021FE20
           -> JMP 0x1413BB140
             -> RQ_ONE 0x14154C9F0
               -> HEAD_DISPATCH 0x14154CF60
-                -> shared downstream 0x1402D8D20
+                -> NOSPLIT 0x14154CFA7
+                  -> downstream 0x1402D8D20
 ```
 
 The important result is not the chain by itself; it is that each recursion step was selected by measured elapsed-time ownership rather than static appearance.
@@ -175,31 +176,40 @@ The current `HEAD_DISPATCH` implementations are both 491 bytes and have very sim
 
 ## Current discriminator
 
-`HEAD_DISPATCH` has two normal direct calls to the same downstream routine:
+The HEAD_DISPATCH path split is decisive:
 
 ```text
-NOSPLIT  1.60.1.7s:0x14154CFA7 -> 0x1402D8D20
-RANGE    1.60.1.7s:0x14154D048 -> 0x1402D8D20
+HEAD sampled                32,359
+HEAD total_qpc          31,679,799
+NOSPLIT calls               32,359
+NOSPLIT total_qpc        31,593,076
+RANGE calls                      0
+HEAD residual_qpc           86,723
 ```
 
-The active experiment separates those two callsites and the residual body cost.
-
-Decision rule:
+At exact `order/pass = 143/144`:
 
 ```text
-one path dominates + gets slower per call
-  -> recurse into that path / shared target
-
-path mix changes but per-call cost stays stable
-  -> quantify composition effect
-
-both paths rise similarly
-  -> recurse into shared target 0x1402D8D20
-
-child calls stay small while residual grows
-  -> split HEAD_DISPATCH body
+HEAD_DISPATCH             2.585 -> 3.869 ms
+NOSPLIT_DISPATCH          2.578 -> 3.863 ms
+NOSPLIT samples             459 -> 407
+NOSPLIT avg qpc             958 -> 1512
+HEAD residual             ~0.007 ms flat
 ```
 
+**FACT:** the accepted sampled HEAD_DISPATCH path is exclusively the no-split callsite.
+
+**FACT:** RANGE was not observed.
+
+**FACT:** essentially all material HEAD_DISPATCH variation is inherited from `1.60.1.7s:0x1402D8D20`.
+
+Current downstream static counterpart:
+
+```text
+1.60.1.7s:0x1402D8D20  <->  1.58.1.4s:0x1401EC530
+```
+
+The next measurement splits the normal direct children inside `0x1402D8D20` and reports residual body cost.
 No behavior patch is justified yet.
 
 ## Secondary validated branch: descriptor/root-binding architecture
