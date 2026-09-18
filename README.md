@@ -2,7 +2,7 @@
 
 Active reverse-engineering investigation of scene-dependent CPU-side stutter in **Euro Truck Simulator 2 1.60.1.7s** using the native DX12 renderer.
 
-> **Status:** the whole-corpus `1.58.1.4s ↔ 1.60.1.7s` static diff is complete. Runtime localization has narrowed sustained heavy-state CPU cost to **pre-render main-loop work** plus `RG_CORE = 1.60.1.7s:0x14021FE20`. `v0.4` and `v0.5` showed that neither raw rendergraph cardinality nor coarse pass composition/work counters are sufficient. `v0.6` now localizes a large fraction of the remaining RG_CORE delta to the **type-1 helper `1.60.1.7s:0x14021F560`**: at exact matched cardinality and effectively unchanged type-1 call count, sampled type-1 per-call cost rises sharply. The next discriminator recurses inside that helper.
+> **Status:** the whole-corpus `1.58.1.4s ↔ 1.60.1.7s` static diff is complete. Runtime localization has narrowed the render-side slowdown from `RG_CORE = 1.60.1.7s:0x14021FE20` to the **type-1 helper `0x14021F560`**, then to its pass callback at `0x14021F73C`. `v0.8` reproduced sustained ~19–24 ms heavy windows and found that all **107,739 sampled callbacks** entered one outer thunk, `0x140226A50`; exact matched `159/160` cardinality showed `RG_CORE 5.265 → 11.121 ms` while callback timing rose `203 → 597 qpc`. Static inspection shows that target is only a nested-object/vtable dispatch thunk, so the next discriminator resolves the final implementation behind it.
 
 ## What is being investigated
 
@@ -130,9 +130,30 @@ type-7 estimated/RG_CORE       0.000 ms     0.000 ms
 
 The type-1 path explains about **2.28 ms of the 2.97 ms RG_CORE increase** in this exact pair, while type-4/type-7 timing is effectively flat. The same direction repeats across several other exact-cardinality groups.
 
-## Current next step — recurse inside type 1
+## Current next step — resolve the implementation behind the callback thunk
 
-The next runtime discriminator keeps the accepted parent and type-1 timing, then aligns internal measurements to the same sampled type-1 calls. It separates the device-facing +0x208 call, the pass-specific callback, pre-tail work and a derived final +0x108 tail cost.
+`v0.7.1` showed that essentially all sampled type-1 cost variation is inside the pass callback at `0x14021F73C`.
+
+`v0.8` then found exactly one outer callback target across 107,739 samples:
+
+```text
+1.60.1.7s:0x140226A50
+MOV RCX,[RCX+0x110]
+MOV RAX,[RCX]
+JMP qword ptr [RAX+0x8]
+```
+
+This is a dispatch thunk rather than the substantive implementation.
+
+The next discriminator resolves:
+
+```text
+inner      = *(callback_object + 0x110)
+inner_vtbl = *inner
+final      = *(inner_vtbl + 0x8)
+```
+
+on the same sampled T1 calls and buckets the already-measured callback duration by that final target.
 
 No behavior patch is justified yet.
 
