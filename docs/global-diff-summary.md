@@ -95,7 +95,7 @@ That caller contains the same broad frame-render flow and invokes the copy helpe
 
 The static mapping remains high confidence, but the direct-cost hypothesis did **not** survive runtime frequency measurement.
 
-`NemoRenderQueueProbe v0.2` found only:
+Runtime follow-up found only:
 
 ```text
 14 direct calls across 24,798 rendered frames
@@ -182,35 +182,46 @@ This is a better use of the completed static map than continuing to select funct
 
 ## Current runtime localization result
 
-`NemoFramePhaseProbe v0.1` measures a main-loop chain around:
+The whole-corpus map is now being used only after runtime ownership is measured.
+
+The active render-side chain has been narrowed to:
 
 ```text
-0x1401C77C0  LOOP
-0x1401C6CB0  PACE
-0x1401D72F0  RENDER
+RG_CORE 1.60.1.7s:0x14021FE20
+  -> T1 helper 0x14021F560
+    -> pass callback 0x14021F73C
+      -> nested winner 0x1413BB140
+        -> RQ_ONE 0x14154C9F0
+          -> HEAD_DISPATCH 0x14154CF60
+            -> 0x1402D8D20
 ```
 
-Two separate natural good→heavy transitions showed:
+At exact matched `156/157` rendergraph cardinality:
 
 ```text
-transition A: LOOP +4.116 ms, RENDER +1.641 ms, OTHER +2.475 ms
-transition B: LOOP +3.745 ms, RENDER +2.007 ms, OTHER +1.738 ms
+RQ_ONE parent    1.855 -> 4.002 ms
+HEAD_DISPATCH    1.850 -> 3.997 ms
+HEAD samples       398 -> 386
+HEAD avg qpc       842 -> 1727
 ```
 
-`PACE` stayed around `~0.001 ms/iteration`.
+The current measured leaf therefore becomes more expensive per call rather than simply more frequent.
 
-The broad `RENDER` bucket contains a nested deliberate frame-time wait helper at `1.60.1.7s:0x14011F730`, so the next probe separates `WAIT` from active render work.
+The static map is now used to compare that measured hotspot against its 1.58 counterpart:
 
-See [`runtime-phase-localization.md`](runtime-phase-localization.md).
+```text
+1.60.1.7s:0x14154CF60  <->  1.58.1.4s:0x1413D7700
+1.60.1.7s:0x1402D8D20  <->  1.58.1.4s:0x1401EC530
+```
+
+See [`current-findings.md`](current-findings.md) and [`rg-core-runtime-localization.md`](rg-core-runtime-localization.md).
 
 ## Current question
 
-The investigation is no longer asking:
-
-> Which static delta looks most suspicious?
+The project is no longer asking which static delta looks most suspicious.
 
 It is asking:
 
-> Which coarse runtime phase actually gains the missing milliseconds in the heavy state, and what exact 1.58→1.60 code/data change inside that measured phase explains the delta?
+> Which exact operation inside the measured runtime owner explains the missing milliseconds, and what 1.58 -> 1.60 code/data change accounts for that measured cost?
 
 Do not return to broad per-D3D-call profiling or generic p3mem hooks without new evidence.
