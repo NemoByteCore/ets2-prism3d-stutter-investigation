@@ -246,25 +246,41 @@ JMP qword ptr [RAX+0x8]
 
 So there is no outer callback-target composition shift. The entire sampled population goes through one thunk, and the substantive implementation is one nested vtable dispatch deeper.
 
-## Immediate technical direction
+### v0.9 — one nested implementation dominates T1 variation
 
-`v0.9` resolves the final nested target on the same sampled T1 callback calls:
+v0.9 resolved the final nested callback targets. The dominant target is:
 
 ```text
-inner      = *(callback_object + 0x110)
-inner_vtbl = *inner
-final      = *(inner_vtbl + 0x8)
+0x1413BD3F0 -> JMP 0x1413BB140
 ```
 
-The original callback CALL and thunk remain unchanged. The already-measured callback duration is bucketed by this final target.
+It accounts for about **60.6%** of sampled T1 time and correlates strongly with T1 estimated cost (`r ≈ 0.973`).
+
+Exact `order/pass = 144/145`:
 
 ```text
-sampled T1 callback
-  -> resolve final nested implementation
-  -> separate final-target mix from per-target slowdown
-  -> recurse only into the measured final implementation that owns the cost
-  -> map that implementation to 1.58 ↔ 1.60
-  -> patch only after the missing-ms mechanism is concrete
+                              LOW-COST    HIGH-COST
+RG_CORE                        4.590 ms    8.580 ms
+type-1 estimated/RG_CORE       2.245 ms    6.096 ms
+winner estimated/RG_CORE       1.421 ms    4.661 ms
+winner sampled calls             649         583
+winner sample avg qpc             410        1354
+```
+
+**FACT:** the winner's cost increase is predominantly per-call slowdown, not increased call count.
+
+Static mapping identifies the substantive 1.60 implementation at `0x1413BB140` and a close 1.58 counterpart at `0x14120D6B0`. A queue-data stride/layout change is present between versions, but remains only a static clue.
+
+## Immediate technical direction
+
+The next discriminator splits seven direct child calls inside `0x1413BB140` and reports residual body cost, only for the already-localized winning T1 path.
+
+```text
+winner callback
+  -> direct-child timing + residual
+  -> identify concrete child/body mechanism
+  -> compare that mechanism 1.58 ↔ 1.60
+  -> patch only after the missing-ms budget is localized
 ```
 
 No behavior patch is justified yet.
