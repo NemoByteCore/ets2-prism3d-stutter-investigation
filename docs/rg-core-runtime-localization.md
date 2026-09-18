@@ -249,12 +249,52 @@ Across accepted full windows, the sampled T1 duration and callback duration corr
 
 **INFERENCE:** the next useful discriminator is the actual indirect callback implementation, not another broad T1 split.
 
-## v0.8 direction
+## v0.8 — one outer callback target, and it is only a thunk
 
-The next probe keeps the accepted parent/cardinality and helper timing, then records the actual indirect callback target function on the same sampled T1 calls. Per-target sample counts and durations will distinguish:
+v0.8 reproduced the canonical sustained heavy state, including several ~19–24 ms windows. Every one of **107,739 sampled T1 callbacks** resolved to the same outer callback target:
 
-- a change in callback-target composition;
-- one stable callback implementation becoming slower;
-- or several callback implementations contributing independently.
+```text
+1.60.1.7s:0x140226A50
+```
+
+At exact matched `order/pass = 159/160`:
+
+```text
+                              SMOOTH      HEAVY
+LOOP                          16.673 ms   21.716 ms
+RG_CORE                        5.265 ms   11.121 ms
+type-1 sample avg                207 qpc      601 qpc
+outer callback avg               203 qpc      597 qpc
+```
+
+So at identical rendergraph cardinality the T1 increase (`+394 qpc`) is mirrored essentially exactly by the one callback target (`+394 qpc`).
+
+Targeted static inspection then showed that `0x140226A50` is not the substantive implementation:
+
+```text
+MOV RCX,[RCX+0x110]
+MOV RAX,[RCX]
+JMP qword ptr [RAX+0x8]
+```
+
+It is a dispatch thunk that loads a nested object from `callback_object + 0x110` and tail-jumps through that object's vtable slot `+0x8`.
+
+**FACT:** there is no outer callback-target composition shift in the accepted v0.8 run.
+
+**FACT:** the entire sampled population goes through one thunk.
+
+**FACT:** the actual implementation is one indirect level deeper.
+
+## v0.9 direction
+
+The next probe resolves the final nested target on the same sampled T1 calls before callback timing begins:
+
+```text
+inner      = *(callback_object + 0x110)
+inner_vtbl = *inner
+final      = *(inner_vtbl + 0x8)
+```
+
+The original callback CALL and thunk execution remain unchanged. Callback duration is bucketed by this final target.
 
 No behavior patch is justified yet.
