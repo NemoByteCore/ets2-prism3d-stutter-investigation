@@ -218,16 +218,52 @@ Across accepted full windows, `corr(type-1, callback) ≈ 0.9995`.
 
 **FACT:** the measured device +0x208 and final +0x108 tail paths are negligible compared with the callback.
 
-## Immediate technical direction
+### v0.8 — one callback target, still not the final implementation
 
-`v0.8` records the actual indirect callback function target on the same sampled type-1 calls and aggregates sample count/duration per target.
+v0.8 reproduced the sustained heavy scene state and found that **all 107,739 sampled T1 callbacks** targeted exactly one address:
 
 ```text
-sampled type-1 callback
-  -> identify exact indirect target implementation(s)
-  -> separate target-composition shifts from per-target slowdown
-  -> recurse only into the measured target that owns the cost
-  -> map that target to 1.58 ↔ 1.60
+1.60.1.7s:0x140226A50
+```
+
+Exact matched `order/pass = 159/160`:
+
+```text
+                              SMOOTH      HEAVY
+LOOP                          16.673 ms   21.716 ms
+RG_CORE                        5.265 ms   11.121 ms
+type-1 sample avg                207 qpc      601 qpc
+outer callback avg               203 qpc      597 qpc
+```
+
+Targeted static inspection shows that `0x140226A50` is only:
+
+```text
+MOV RCX,[RCX+0x110]
+MOV RAX,[RCX]
+JMP qword ptr [RAX+0x8]
+```
+
+So there is no outer callback-target composition shift. The entire sampled population goes through one thunk, and the substantive implementation is one nested vtable dispatch deeper.
+
+## Immediate technical direction
+
+`v0.9` resolves the final nested target on the same sampled T1 callback calls:
+
+```text
+inner      = *(callback_object + 0x110)
+inner_vtbl = *inner
+final      = *(inner_vtbl + 0x8)
+```
+
+The original callback CALL and thunk remain unchanged. The already-measured callback duration is bucketed by this final target.
+
+```text
+sampled T1 callback
+  -> resolve final nested implementation
+  -> separate final-target mix from per-target slowdown
+  -> recurse only into the measured final implementation that owns the cost
+  -> map that implementation to 1.58 ↔ 1.60
   -> patch only after the missing-ms mechanism is concrete
 ```
 
