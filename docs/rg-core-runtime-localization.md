@@ -287,52 +287,61 @@ It is a dispatch thunk that loads a nested object from `callback_object + 0x110`
 
 ## v0.9 — dominant final implementation identified
 
-v0.9 resolved the nested final callback targets on the same sampled T1 calls. The dominant target was:
+v0.9 resolved the nested final callback targets and identified `0x1413BD3F0 -> JMP 0x1413BB140` as the dominant implementation path.
+
+At exact `144/145` cardinality, its estimated contribution rises `1.421 -> 4.661 ms` while sampled count falls `649 -> 583`. The increase is therefore per-call cost rather than increased frequency.
+
+## v0.10 — direct-child split localizes the winner to RQ_ONE
+
+v0.10 split `0x1413BB140` into seven direct child calls plus residual. The run remained structurally clean.
+
+At exact matched `order/pass = 160/161`:
 
 ```text
-RVA 0x013BD3F0
-absolute 0x1413BD3F0
-80,999 samples
-~60.64% of total sampled T1 time
-corr(T1 estimated cost, target estimated cost) ≈ 0.973
+                              SMOOTH      HIGH-COST    DELTA
+RG_CORE                        6.925 ms   11.358 ms    +4.433
+winner parent                  2.286 ms    5.743 ms    +3.456
+RQ_ONE 0x14154C9F0            1.682 ms    4.535 ms    +2.854
+RQ_PREP 0x14154C370           0.448 ms    1.023 ms    +0.575
+RQ_ALL                         0.127 ms    0.155 ms    +0.028
+winner residual                0.022 ms    0.022 ms    ~0
 ```
 
-Exact matched `order/pass = 144/145`:
+`RQ_ONE` sampled calls fall `496 -> 352`, while average sampled duration rises `635 -> 1940 qpc`.
+
+Across normal windows:
 
 ```text
-                              LOW-COST    HIGH-COST    DELTA
-RG_CORE                        4.590 ms    8.580 ms    +3.990
-type-1 estimated/RG_CORE       2.245 ms    6.096 ms    +3.851
-winner estimated/RG_CORE       1.421 ms    4.661 ms    +3.240
-winner sampled calls             649         583
-winner sample avg qpc             410        1354
+corr(winner parent, RQ_ONE)  ≈ 0.9982
+corr(winner parent, RQ_PREP) ≈ 0.9681
 ```
 
-Several other exact-cardinality pairs repeat the same result.
+**FACT:** direct children explain essentially all measured winner cost.
 
-**FACT:** increased winner frequency is not the explanation; the dominant target becomes substantially more expensive per call.
+**FACT:** winner-body residual is negligible.
 
-Targeted static inspection shows:
+**FACT:** `RQ_ONE = 0x14154C9F0` is the dominant owner of winner cost variation; `RQ_PREP` is secondary.
+
+**FACT:** the RQ_ONE slowdown is predominantly per-call, not a higher invocation count.
+
+The close static counterpart is:
 
 ```text
-0x1413BD3F0  JMP 0x1413BB140
+1.60 0x14154C9F0, size 1382
+1.58 0x1413D7170, size 1417
 ```
 
-so the substantive implementation is `0x1413BB140`, size 936 bytes. Its close 1.58 counterpart is `0x14120D6B0`, size 940 bytes.
+## v0.11 direction
 
-A static render-queue layout delta is visible inside this function:
+The next probe preserves the accepted chain and times four normal direct callsites inside `RQ_ONE`:
 
 ```text
-1.58 queue_data stride 0x48, base/count +0x1F0/+0x1F8
-1.60 queue_data stride 0x58, base/count +0x220/+0x228
+0x14154CA29 -> 0x14154CF60   head dispatch
+0x14154CC1B -> 0x1402158E0   view/state update
+0x14154CDAE -> 0x140281C80   command allocation
+0x14154CDE9 -> 0x14154CF60   inner per-entry dispatch
 ```
 
-This is not yet accepted as the cause.
-
-## v0.10 direction
-
-The next probe times seven concrete direct children inside `0x1413BB140` only for already-sampled T1 calls whose final target is the winner, and also reports untimed residual body cost.
-
-The goal is to decide whether the winner delta belongs to one direct child, several children, or the winner body itself before any behavior patch.
+The two `0x14154CF60` sites stay separate because they occur at different structural positions.
 
 No behavior patch is justified yet.
