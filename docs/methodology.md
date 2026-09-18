@@ -66,7 +66,7 @@ Prefer:
 
 ## Observer-effect rule
 
-`NemoShaderProfileProbe v0.2` demonstrated that broad direct-D3D hooking can create workload proportional to the exact scene complexity being measured.
+A broad profile-aware D3D12 probe demonstrated that direct-D3D hooking can create workload proportional to the exact scene complexity being measured.
 
 Therefore future probes should avoid tens of thousands of wrappers per frame when a narrow internal hook/counter can answer the question.
 
@@ -136,21 +136,29 @@ Large functions that are editor/load/UI/setup paths are demoted even if their st
 
 ## Current runtime discriminator
 
-Current top target:
+The active measured leaf is:
 
 ```text
-1.60.1.7s:0x14154AAB0
+1.60.1.7s:0x14154CF60  HEAD_DISPATCH
 ```
 
-First measure:
+It accounts for about 99.84% of sampled `RQ_ONE` time in the accepted run.
 
-- helper calls/window
-- queue-set count if safe/read-only
-- cheap ownership/refcount-heavy branch entries if identifiable
+The current discriminator separates its two normal calls to the same downstream routine:
 
-Only after positive correlation should aggregate/sampled timing be added.
+```text
+NOSPLIT  1.60.1.7s:0x14154CFA7 -> 0x1402D8D20
+RANGE    1.60.1.7s:0x14154D048 -> 0x1402D8D20
+```
 
-If the measured cost is negligible, demote the candidate rather than deepening the branch to rescue the theory.
+Interpretation rule:
+
+- if one path dominates and slows per call, recurse into that path/shared target;
+- if path mix changes while per-call cost stays stable, quantify the composition effect;
+- if both paths slow similarly, recurse into shared `0x1402D8D20`;
+- if child calls stay small while residual grows, split the `HEAD_DISPATCH` body.
+
+Do not patch behavior until the missing-ms budget is attached to a concrete mechanism.
 
 ## Result template
 
