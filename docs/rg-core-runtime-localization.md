@@ -215,7 +215,7 @@ parent qpc/item   ~9.62 -> ~10.19
 
 **FACT:** rendergraph pass/order count is therefore too coarse even when exactly matched; queue-level item count is the more relevant workload variable at this leaf.
 
-The next discriminator attributes item count and measured HEAD time by queue pointer. The goal is to determine whether one queue object owns the growth or whether many queues expand together.
+Raw queue-data pointer identity proved too transient to be useful. The next discriminator therefore derives a stable queue-data index from the active render-queue-set owner and attributes item count / measured HEAD time by that index plus descriptor metadata.
 No behavior patch is justified yet.
 
 ## Secondary measured branches
