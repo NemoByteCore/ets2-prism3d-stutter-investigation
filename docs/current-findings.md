@@ -218,7 +218,7 @@ parent qpc / item           ~9.62 -> ~10.19  (~+6%)
 
 **FACT:** most of the previously observed apparent per-call slowdown is explained by larger item batches, not by the same constant work becoming 3–4x slower.
 
-**CURRENT QUESTION:** which queue object(s) own the item-count growth? The next measurement attributes sampled HEAD calls, item totals and measured qpc to queue identity before recursing any deeper into constant-cost children.
+**CURRENT QUESTION:** which stable queue-data index or queue class owns the item-count growth? Raw queue-data pointers churn almost every sampled call, so pointer identity is not useful. The active measurement derives a stable index from the render-queue-set owner and attaches descriptor metadata before recursing any deeper into constant-cost children.
 
 The runtime path also reconnects to the descriptor/resource architecture because `BUNDLE_BUILD = 0x1402D7D70` is the generalized resource-bundle builder already mapped there. The prior sampler-reuse result still shows that sampler allocation/copy pressure is only part of the story.
 No behavior patch is justified yet.
