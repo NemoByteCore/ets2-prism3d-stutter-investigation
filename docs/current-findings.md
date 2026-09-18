@@ -252,40 +252,51 @@ v0.9 identified `0x1413BD3F0 -> 0x1413BB140` as the dominant nested T1 callback 
 
 ### v0.10 — winner cost is dominated by RQ_ONE
 
-v0.10 split `0x1413BB140` into direct child calls plus residual.
+v0.10 localized most winner cost variation to `RQ_ONE = 0x14154C9F0`, with `RQ_PREP` secondary and winner-body residual negligible.
 
-Exact matched `order/pass = 160/161`:
+### v0.11 — RQ_ONE cost is effectively all HEAD_DISPATCH
+
+v0.11 split four direct callsites inside RQ_ONE.
 
 ```text
-                              SMOOTH      HIGH-COST
-RG_CORE                        6.925 ms   11.358 ms
-winner parent                  2.286 ms    5.743 ms
-RQ_ONE 0x14154C9F0            1.682 ms    4.535 ms
-RQ_PREP 0x14154C370           0.448 ms    1.023 ms
-winner residual                0.022 ms    0.022 ms
+RQ_ONE parent total_qpc      24,363,328
+HEAD_DISPATCH total_qpc      24,324,287
+VIEW_UPDATE calls                     0
+CMD_ALLOC calls                       0
+INNER_DISPATCH calls                  0
+RQ_ONE residual_qpc              39,041
 ```
 
-The `RQ_ONE` sampled count falls `496 -> 352`, while average duration rises `635 -> 1940 qpc`.
+At exact `156/157` cardinality:
 
-**FACT:** `RQ_ONE = 1.60.1.7s:0x14154C9F0` is the dominant concrete child currently measured.
+```text
+RQ_ONE parent    1.855 -> 4.002 ms
+HEAD_DISPATCH    1.850 -> 3.997 ms
+HEAD samples       398 -> 386
+HEAD avg qpc       842 -> 1727
+```
 
-**FACT:** `RQ_PREP` is a secondary measured contributor.
+**FACT:** `HEAD_DISPATCH = 1.60.1.7s:0x14154CF60` accounts for about 99.84% of measured sampled RQ_ONE time.
 
-**FACT:** winner body residual is negligible and does not explain the heavy-state delta.
+**FACT:** the slowdown is per-call, not increased invocation frequency.
+
+Static counterpart:
+
+```text
+1.60 0x14154CF60 <-> 1.58 0x1413D7700
+```
 
 ## Immediate technical direction
 
-Split the four normal direct callsites inside `RQ_ONE` while preserving the established sampled winner context:
+Split the two normal direct calls from HEAD_DISPATCH to `0x1402D8D20`:
 
 ```text
-HEAD_DISPATCH_154CF60
-VIEW_UPDATE_2158E0
-CMD_ALLOC_281C80
-INNER_DISPATCH_154CF60
-+ RQ_ONE residual
+NOSPLIT 0x14154CFA7 -> 0x1402D8D20
+RANGE   0x14154D048 -> 0x1402D8D20
++ HEAD_DISPATCH residual
 ```
 
-Then recurse only into the measured owner. `RQ_PREP` remains a backlog branch rather than a parallel investigation.
+Then recurse only into the measured path/shared target. `RQ_PREP` and `PRE_RENDER_OTHER` remain backlog branches.
 
 No behavior patch is justified yet.
 
