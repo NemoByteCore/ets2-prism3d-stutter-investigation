@@ -246,42 +246,46 @@ JMP qword ptr [RAX+0x8]
 
 So there is no outer callback-target composition shift. The entire sampled population goes through one thunk, and the substantive implementation is one nested vtable dispatch deeper.
 
-### v0.9 — one nested implementation dominates T1 variation
+### v0.9 — dominant nested implementation
 
-v0.9 resolved the final nested callback targets. The dominant target is:
+v0.9 identified `0x1413BD3F0 -> 0x1413BB140` as the dominant nested T1 callback implementation, with about 60.6% of sampled T1 time and strong cost correlation.
 
-```text
-0x1413BD3F0 -> JMP 0x1413BB140
-```
+### v0.10 — winner cost is dominated by RQ_ONE
 
-It accounts for about **60.6%** of sampled T1 time and correlates strongly with T1 estimated cost (`r ≈ 0.973`).
+v0.10 split `0x1413BB140` into direct child calls plus residual.
 
-Exact `order/pass = 144/145`:
+Exact matched `order/pass = 160/161`:
 
 ```text
-                              LOW-COST    HIGH-COST
-RG_CORE                        4.590 ms    8.580 ms
-type-1 estimated/RG_CORE       2.245 ms    6.096 ms
-winner estimated/RG_CORE       1.421 ms    4.661 ms
-winner sampled calls             649         583
-winner sample avg qpc             410        1354
+                              SMOOTH      HIGH-COST
+RG_CORE                        6.925 ms   11.358 ms
+winner parent                  2.286 ms    5.743 ms
+RQ_ONE 0x14154C9F0            1.682 ms    4.535 ms
+RQ_PREP 0x14154C370           0.448 ms    1.023 ms
+winner residual                0.022 ms    0.022 ms
 ```
 
-**FACT:** the winner's cost increase is predominantly per-call slowdown, not increased call count.
+The `RQ_ONE` sampled count falls `496 -> 352`, while average duration rises `635 -> 1940 qpc`.
 
-Static mapping identifies the substantive 1.60 implementation at `0x1413BB140` and a close 1.58 counterpart at `0x14120D6B0`. A queue-data stride/layout change is present between versions, but remains only a static clue.
+**FACT:** `RQ_ONE = 1.60.1.7s:0x14154C9F0` is the dominant concrete child currently measured.
+
+**FACT:** `RQ_PREP` is a secondary measured contributor.
+
+**FACT:** winner body residual is negligible and does not explain the heavy-state delta.
 
 ## Immediate technical direction
 
-The next discriminator splits seven direct child calls inside `0x1413BB140` and reports residual body cost, only for the already-localized winning T1 path.
+Split the four normal direct callsites inside `RQ_ONE` while preserving the established sampled winner context:
 
 ```text
-winner callback
-  -> direct-child timing + residual
-  -> identify concrete child/body mechanism
-  -> compare that mechanism 1.58 ↔ 1.60
-  -> patch only after the missing-ms budget is localized
+HEAD_DISPATCH_154CF60
+VIEW_UPDATE_2158E0
+CMD_ALLOC_281C80
+INNER_DISPATCH_154CF60
++ RQ_ONE residual
 ```
+
+Then recurse only into the measured owner. `RQ_PREP` remains a backlog branch rather than a parallel investigation.
 
 No behavior patch is justified yet.
 
