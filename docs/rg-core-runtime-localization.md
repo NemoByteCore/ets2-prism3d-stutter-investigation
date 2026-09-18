@@ -212,17 +212,49 @@ The same direction repeats in exact-cardinality groups `162/163`, `169/170`, `17
 
 **INFERENCE:** the next useful discriminator is inside the type-1 helper itself, especially its callback/device-facing work.
 
-## v0.7 direction
+## v0.7.1 — T1 cost localizes to the pass callback
 
-The next probe keeps the accepted parent/cardinality/type-1/type-4/type-7 timing and aligns internal measurements to the same sampled type-1 calls. It separates:
+The corrected v0.7.1 probe aligned three internal measurements to the same sampled type-1 calls:
 
 ```text
-device-facing +0x208 call
-pass-specific callback
-elapsed pre-tail body
-derived final tail +0x108 cost
+0x14021F70F  device-facing +0x208 call
+0x14021F73C  pass-specific callback through vtable +0x8
+0x14021F773  pre-tail marker before the final +0x108 JMP
 ```
 
-The final device operation is a true tail jump and must remain a jump; its cost is derived rather than instrumented by converting it to a call.
+This drive did not reproduce the earlier canonical sustained 19–21+ ms heavy state, so it is not used to replace the v0.6 heavy-state budget. It is still decisive for the narrower intra-T1 question.
+
+At exact matched order/pass cardinality `151 / 152`:
+
+```text
+                              LOW-COST    HIGH-COST
+LOOP                          16.677 ms   17.503 ms
+RG_CORE                        4.681 ms    9.393 ms
+type-1 sample avg                206 qpc      603 qpc
+device +0x208                      0 qpc        0 qpc
+callback +0x8                    200 qpc      596 qpc
+pre-tail                         204 qpc      601 qpc
+derived final tail                 2 qpc        2 qpc
+```
+
+The type-1 increase is `+397 qpc`; the callback increase is `+396 qpc`.
+
+Across accepted full windows, the sampled T1 duration and callback duration correlate at about `0.9995`. Several other exact-cardinality pairs repeat the same one-for-one behavior.
+
+**FACT:** nearly all sampled type-1 time is inside the indirect pass callback at `1.60.1.7s:0x14021F73C`.
+
+**FACT:** the measured device +0x208 path and final +0x108 tail path are negligible compared with the callback.
+
+**FACT:** exact-cardinality T1 cost variation is mirrored almost one-for-one by callback-duration variation.
+
+**INFERENCE:** the next useful discriminator is the actual indirect callback implementation, not another broad T1 split.
+
+## v0.8 direction
+
+The next probe keeps the accepted parent/cardinality and helper timing, then records the actual indirect callback target function on the same sampled T1 calls. Per-target sample counts and durations will distinguish:
+
+- a change in callback-target composition;
+- one stable callback implementation becoming slower;
+- or several callback implementations contributing independently.
 
 No behavior patch is justified yet.
