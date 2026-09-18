@@ -1,6 +1,6 @@
 # Current findings
 
-Updated: **2026-09-16**
+Updated: **2026-09-18**
 
 ## Scope
 
@@ -158,6 +158,30 @@ A third `157/158` matched pair differs by about `+4.10 ms` in RG_CORE with essen
 
 See [`rg-core-runtime-localization.md`](rg-core-runtime-localization.md).
 
+### v0.6 — type-1 execution cost is the major measured owner
+
+v0.6 sampled elapsed time in the type-1, type-4 and type-7 helper paths. The run remained structurally clean and retained normal ~16.67 ms windows.
+
+Exact matched order/pass pair:
+
+```text
+                              SMOOTH      HEAVY
+LOOP                          16.678 ms   19.330 ms
+RG_CORE                        5.225 ms    8.196 ms
+order / pass                  168 / 169   168 / 169
+type-1 calls / RG_CORE        ~143.9      ~144.0
+type-1 sample avg              ~16 us      ~32 us
+type-1 estimated/RG_CORE       2.373 ms     4.650 ms
+type-4 estimated/RG_CORE       0.004 ms     0.005 ms
+type-7 estimated/RG_CORE       0.000 ms     0.000 ms
+```
+
+**FACT:** type-1 helper `1.60.1.7s:0x14021F560` owns a large fraction of the measured RG_CORE heavy-state delta.
+
+**FACT:** this is not explained by more type-1 invocations; call count is essentially unchanged while sampled per-call cost rises strongly.
+
+**FACT:** type 4 and type 7 are demoted as major owners in this episode.
+
 ## Current RG_CORE branch targets
 
 Static inspection of `0x14021FE20` identifies three clean direct helper paths:
@@ -174,14 +198,13 @@ The type-4 helper processes its item list and callback/device work. The type-7 h
 
 ## Immediate technical direction
 
-`v0.6` keeps accepted v0.3 timing and v0.4 cardinality, removes the v0.5 pass-mix scanner, and sampled-times only every 16th execution of the three helper callsites above.
+`v0.7` recurses only inside the measured type-1 owner. Internal observations are aligned to the same sampled type-1 calls and separate the device-facing +0x208 call, the pass callback, the pre-tail body, and a derived final +0x108 tail cost.
 
 ```text
 matched smooth vs heavy
-  -> compare sampled type-1 / type-4 / type-7 helper duration
-  -> recurse only into the measured winning branch
-  -> if none explains the delta, isolate RG_CORE residual/tail or use differential CPU stack sampling
-  -> map measured hotspot to 1.58 ↔ 1.60 counterpart
+  -> compare aligned internal type-1 durations
+  -> recurse only into the component that owns the delta
+  -> map the measured hotspot to its 1.58 ↔ 1.60 counterpart
   -> patch only after a concrete missing-ms budget is localized
 ```
 
