@@ -19,7 +19,7 @@ main loop
                   -> 0x1402D8D20
 ```
 
-The current question has shifted again: the downstream routine is not simply doing fixed work much more slowly. At matched rendergraph cardinality, heavy windows can carry **several times more render items per downstream call**. The active question is now which queue object(s) produce that item-count growth.
+The downstream routine is not simply doing fixed work much more slowly. At matched rendergraph cardinality, heavy windows can carry **several times more render items per downstream call**. Raw queue-data addresses churn too aggressively to identify the producer directly, so the active experiment now attributes workload by stable queue-data index and descriptor metadata.
 
 ## Strongest runtime evidence
 
@@ -61,6 +61,10 @@ BUNDLE_BUILD                    0.856 ms    3.341 ms
 The parent gets about `3.6x` more expensive per sampled call while processing about `3.4x` more items. Normalized parent cost per item rises only about **6%**. The per-item `BUNDLE_BUILD = 0x1402D7D70` timing stays roughly flat while its total cost scales with item count.
 
 This means most of the earlier apparent "per-call slowdown" is actually **more render-item work inside each call**, not constant work suddenly taking 3–4x longer.
+
+A follow-up queue-work run strengthened that result: across ordinary windows, downstream cost per rendered frame correlates with average queue item count at about `0.97`. Exact-cardinality examples show item averages such as `76 -> 201`, `72 -> 186`, and `49 -> 160` while sampled queue-call count often falls.
+
+Raw `queue_data_t*` addresses are not stable identities: most sampled calls use transient addresses. Static recovery at the accepted HEAD callsite shows that a stable queue-data index can instead be derived from the active render-queue-set owner, which is the current discriminator.
 
 ## What has already been ruled down
 
