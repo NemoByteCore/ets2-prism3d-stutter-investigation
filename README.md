@@ -2,7 +2,7 @@
 
 Active reverse-engineering investigation of scene-dependent CPU-side stutter in **Euro Truck Simulator 2 1.60.1.7s** using the native DX12 renderer.
 
-> **Status:** the whole-corpus `1.58.1.4s ↔ 1.60.1.7s` static diff is complete. Runtime localization has narrowed the render-side slowdown from `RG_CORE = 0x14021FE20` to type-1 helper `0x14021F560`, its pass callback `0x14021F73C`, and now a dominant nested implementation path. `v0.9` shows that final target `0x1413BD3F0 -> JMP 0x1413BB140` accounts for about **60.6% of sampled T1 time** and tracks T1 cost with `r ≈ 0.973`; at exact `144/145` cardinality its estimated contribution rises `1.421 → 4.661 ms` while sampled call count falls slightly. The next discriminator splits the direct children of `0x1413BB140`.
+> **Status:** runtime localization has narrowed the render-side slowdown to `RQ_ONE = 1.60.1.7s:0x14154C9F0`, reached through `RG_CORE -> T1_HELPER -> pass callback -> nested winner 0x1413BB140`. In `v0.10`, exact matched `160/161` cardinality shows the winner rising `2.286 -> 5.743 ms`; `RQ_ONE` alone rises `1.682 -> 4.535 ms` while its sampled call count falls. The next discriminator splits the four normal direct callsites inside `RQ_ONE`.
 
 ## What is being investigated
 
@@ -130,33 +130,43 @@ type-7 estimated/RG_CORE       0.000 ms     0.000 ms
 
 The type-1 path explains about **2.28 ms of the 2.97 ms RG_CORE increase** in this exact pair, while type-4/type-7 timing is effectively flat. The same direction repeats across several other exact-cardinality groups.
 
-## v0.9 result — dominant nested implementation identified
+## v0.10 result — RQ_ONE is the dominant concrete child
 
-v0.9 resolved the final nested callback implementations. The dominant target is:
-
-```text
-1.60.1.7s:0x1413BD3F0
-  -> JMP 0x1413BB140
-```
-
-Across the run it accounts for about **60.6%** of sampled T1 time. At exact `order/pass = 144/145`:
+The substantive winner `0x1413BB140` was split into seven direct children plus residual. At exact matched `order/pass = 160/161`:
 
 ```text
-                              LOW-COST    HIGH-COST
-RG_CORE                        4.590 ms    8.580 ms
-type-1 estimated/RG_CORE       2.245 ms    6.096 ms
-0x1413BD3F0 estimated/RG_CORE  1.421 ms    4.661 ms
-winner sampled calls             649         583
-winner sample avg qpc             410        1354
+                              SMOOTH      HIGH-COST
+RG_CORE                        6.925 ms   11.358 ms
+winner 0x1413BB140             2.286 ms    5.743 ms
+RQ_ONE 0x14154C9F0            1.682 ms    4.535 ms
+RQ_PREP 0x14154C370           0.448 ms    1.023 ms
+winner residual                0.022 ms    0.022 ms
 ```
 
-The winner becomes much more expensive per call rather than simply more frequent.
+The `RQ_ONE` contribution rises by about **2.85 ms** while its sampled call count falls `496 -> 352`; average sampled duration rises `635 -> 1940 qpc`.
 
-Static mapping identifies the substantive function as `0x1413BB140` (936 bytes), with a close 1.58 counterpart at `0x14120D6B0` (940 bytes). A render-queue data-layout change is visible between the versions, including item stride `0x48 → 0x58`, but this remains a **static observation**, not a causal conclusion.
+Across normal windows, winner cost and `RQ_ONE` cost correlate at about `0.998`.
 
-## Current next step — split the substantive winner
+**FACT:** `RQ_ONE = 0x14154C9F0` is the dominant measured owner inside the winning callback implementation. `RQ_PREP` is a secondary contributor; winner-body residual is negligible.
 
-The next probe times seven direct child calls inside `0x1413BB140` and separately measures the residual body cost, only for already-sampled T1 calls that resolve to the winning target.
+Static mapping identifies a close 1.58 counterpart:
+
+```text
+1.60 0x14154C9F0  <->  1.58 0x1413D7170
+```
+
+## Current next step — split RQ_ONE
+
+The next probe separately times four normal direct callsites inside `0x14154C9F0`:
+
+```text
+HEAD_DISPATCH_154CF60
+VIEW_UPDATE_2158E0
+CMD_ALLOC_281C80
+INNER_DISPATCH_154CF60
+```
+
+and reports the remaining RQ_ONE residual. This should distinguish dispatch cost from view/state update, command allocation, or body work.
 
 No behavior patch is justified yet.
 
