@@ -1,6 +1,6 @@
 # Current findings
 
-Updated: **2026-09-18**
+Updated: **2026-09-19**
 
 ## Scope
 
@@ -174,42 +174,53 @@ HEAD avg qpc                     842        1727
 
 The current `HEAD_DISPATCH` implementations are both 491 bytes and have very similar high-level structure. The useful question is therefore runtime path/cost behavior, not size alone.
 
-## Current discriminator
+## Current measured mechanism: render-item workload growth
 
-The HEAD_DISPATCH path split is decisive:
-
-```text
-HEAD sampled                32,359
-HEAD total_qpc          31,679,799
-NOSPLIT calls               32,359
-NOSPLIT total_qpc        31,593,076
-RANGE calls                      0
-HEAD residual_qpc           86,723
-```
-
-At exact `order/pass = 143/144`:
+The no-split downstream routine was split into direct children and residual. Its dominant direct child is the per-item resource bundle builder:
 
 ```text
-HEAD_DISPATCH             2.585 -> 3.869 ms
-NOSPLIT_DISPATCH          2.578 -> 3.863 ms
-NOSPLIT samples             459 -> 407
-NOSPLIT avg qpc             958 -> 1512
-HEAD residual             ~0.007 ms flat
+1.60.1.7s:0x1402D7D70  BUNDLE_BUILD
 ```
 
-**FACT:** the accepted sampled HEAD_DISPATCH path is exclusively the no-split callsite.
-
-**FACT:** RANGE was not observed.
-
-**FACT:** essentially all material HEAD_DISPATCH variation is inherited from `1.60.1.7s:0x1402D8D20`.
-
-Current downstream static counterpart:
+Across the full accepted run:
 
 ```text
-1.60.1.7s:0x1402D8D20  <->  1.58.1.4s:0x1401EC530
+downstream parent total_qpc   72,799,025
+BUNDLE_BUILD                  40,696,415  (55.90%)
+residual                      25,980,488  (35.69%)
+SPECIAL                        3,488,428  (4.79%)
+CMD_ALLOC                      2,070,928  (2.84%)
 ```
 
-The next measurement splits the normal direct children inside `0x1402D8D20` and reports residual body cost.
+The key result is workload count, not just child timing. At exact matched `order/pass = 168/169`:
+
+```text
+                              LOW-COST    HIGH-COST
+downstream parent              1.520 ms    5.796 ms
+sampled parent calls             488         443
+processed render items        29,641      92,128
+items / parent                  60.7       208.0
+BUNDLE_BUILD                    0.856 ms    3.341 ms
+residual                        0.537 ms    2.016 ms
+```
+
+Derived normalization:
+
+```text
+parent qpc / sampled call   ~584  -> ~2118   (~3.63x)
+items / sampled call        ~60.7 -> ~208.0  (~3.43x)
+parent qpc / item           ~9.62 -> ~10.19  (~+6%)
+```
+
+`BUNDLE_BUILD` and `CMD_ALLOC` execute once per processed item in this routine, so their call counts expose item workload directly. `BUNDLE_BUILD` average timing remains about `5 qpc/item` while its total cost rises with item count.
+
+**FACT:** matched rendergraph pass/order cardinality can hide a much larger difference in the number of render items carried by each queue/downstream call.
+
+**FACT:** most of the previously observed apparent per-call slowdown is explained by larger item batches, not by the same constant work becoming 3–4x slower.
+
+**CURRENT QUESTION:** which queue object(s) own the item-count growth? The next measurement attributes sampled HEAD calls, item totals and measured qpc to queue identity before recursing any deeper into constant-cost children.
+
+The runtime path also reconnects to the descriptor/resource architecture because `BUNDLE_BUILD = 0x1402D7D70` is the generalized resource-bundle builder already mapped there. The prior sampler-reuse result still shows that sampler allocation/copy pressure is only part of the story.
 No behavior patch is justified yet.
 
 ## Secondary validated branch: descriptor/root-binding architecture
