@@ -285,16 +285,54 @@ It is a dispatch thunk that loads a nested object from `callback_object + 0x110`
 
 **FACT:** the actual implementation is one indirect level deeper.
 
-## v0.9 direction
+## v0.9 — dominant final implementation identified
 
-The next probe resolves the final nested target on the same sampled T1 calls before callback timing begins:
+v0.9 resolved the nested final callback targets on the same sampled T1 calls. The dominant target was:
 
 ```text
-inner      = *(callback_object + 0x110)
-inner_vtbl = *inner
-final      = *(inner_vtbl + 0x8)
+RVA 0x013BD3F0
+absolute 0x1413BD3F0
+80,999 samples
+~60.64% of total sampled T1 time
+corr(T1 estimated cost, target estimated cost) ≈ 0.973
 ```
 
-The original callback CALL and thunk execution remain unchanged. Callback duration is bucketed by this final target.
+Exact matched `order/pass = 144/145`:
+
+```text
+                              LOW-COST    HIGH-COST    DELTA
+RG_CORE                        4.590 ms    8.580 ms    +3.990
+type-1 estimated/RG_CORE       2.245 ms    6.096 ms    +3.851
+winner estimated/RG_CORE       1.421 ms    4.661 ms    +3.240
+winner sampled calls             649         583
+winner sample avg qpc             410        1354
+```
+
+Several other exact-cardinality pairs repeat the same result.
+
+**FACT:** increased winner frequency is not the explanation; the dominant target becomes substantially more expensive per call.
+
+Targeted static inspection shows:
+
+```text
+0x1413BD3F0  JMP 0x1413BB140
+```
+
+so the substantive implementation is `0x1413BB140`, size 936 bytes. Its close 1.58 counterpart is `0x14120D6B0`, size 940 bytes.
+
+A static render-queue layout delta is visible inside this function:
+
+```text
+1.58 queue_data stride 0x48, base/count +0x1F0/+0x1F8
+1.60 queue_data stride 0x58, base/count +0x220/+0x228
+```
+
+This is not yet accepted as the cause.
+
+## v0.10 direction
+
+The next probe times seven concrete direct children inside `0x1413BB140` only for already-sampled T1 calls whose final target is the winner, and also reports untimed residual body cost.
+
+The goal is to decide whether the winner delta belongs to one direct child, several children, or the winner body itself before any behavior patch.
 
 No behavior patch is justified yet.
