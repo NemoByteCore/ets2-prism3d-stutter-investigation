@@ -24,9 +24,212 @@ SHA-256:   AB9785331BF9970542C61A0108A4E677C9F7C00FD316D4C0F9AB116F6BE6C234
 
 ## Symptom
 
-The tested setup can hold roughly `16.67 ms / 60 FPS` in light states and sustain roughly `19–25 ms` in heavier scene compositions. The state is scene-dependent rather than a single hitch and can sometimes clear after an unload/ferry/teleport transition.
+The tested setup can hold roughly `16.67 ms / 60 FPS` in light states and sustain roughly `19–25 ms` in heavier scene compositions. The slower state is scene-dependent rather than a single hitch and can sometimes clear after an unload/ferry/teleport transition without restarting the process.
+
+## Broad frame-budget localization
+
+The accepted broad split is:
+
+```text
+                              RECOVERED   HEAVY      DELTA
+LOOP                           16.672 ms   19.735 ms  +3.063 ms
+PRE_RENDER_OTHER                6.285 ms    7.752 ms  +1.467 ms
+POST_RENDER_OTHER               0.381 ms    0.380 ms  ~0
+RG_CORE                         6.271 ms    8.964 ms  +2.693 ms
+```
+
+**FACT:** the measured WAIT helper does not own the sustained slowdown.
+
+**FACT:** non-render growth is in `PRE_RENDER_OTHER`, not post-render cleanup.
+
+**FACT:** the selected render-side positive growth is overwhelmingly in `RG_CORE = 1.60.1.7s:0x14021FE20`.
+
+`PRE_RENDER_OTHER` remains a real secondary branch for later. The current investigation deliberately finishes the render branch first.
+
+## Accepted render-side localization chain
+
+```text
+RG_CORE 0x14021FE20
+  -> T1 helper 0x14021F560
+    -> pass callback 0x14021F73C
+      -> outer thunk 0x140226A50
+        -> nested winner 0x1413BD3F0
+          -> JMP 0x1413BB140
+            -> RQ_ONE 0x14154C9F0
+              -> HEAD_DISPATCH 0x14154CF60
+                -> shared downstream 0x1402D8D20
+```
+
+The important result is not the chain by itself; it is that each recursion step was selected by measured elapsed-time ownership rather than static appearance.
+
+## Why the current leaf is strong
+
+### Rendergraph count and coarse composition are insufficient
+
+Heavy windows can have more rendergraph passes, but matched-cardinality windows remain several milliseconds apart.
+
+At effectively equal `order/pass` count:
+
+```text
+                              SMOOTH      HEAVY
+RG_CORE                        6.253 ms    9.161 ms
+order_count                  192.88      191.16
+pass_count                   193.88      192.16
+```
+
+Matched pass-type/work composition also fails to explain the gap. The same broad workload can execute materially slower.
+
+### T1 helper owns most of the measured RG_CORE delta
+
+At exact `168/169` cardinality:
+
+```text
+                              SMOOTH      HEAVY
+RG_CORE                        5.225 ms    8.196 ms
+T1 calls / RG_CORE            ~143.9      ~144.0
+T1 estimated / RG_CORE         2.373 ms    4.650 ms
+```
+
+Type-4 and type-7 helper timing is effectively flat in the same comparison.
+
+### The pass callback owns the T1 variation
+
+At exact `151/152` cardinality:
+
+```text
+T1 sample avg       206 -> 603 qpc
+callback            200 -> 596 qpc
+device +0x208         0 ->   0 qpc
+derived final tail    2 ->   2 qpc
+```
+
+Across accepted windows, sampled T1 and callback duration correlate at about `0.9995`.
+
+### One nested implementation became the dominant callback owner
+
+The dominant nested target is:
+
+```text
+1.60.1.7s:0x1413BD3F0
+  -> JMP 1.60.1.7s:0x1413BB140
+```
+
+At exact `144/145` cardinality:
+
+```text
+winner estimated / RG_CORE   1.421 -> 4.661 ms
+winner sampled calls           649 -> 583
+winner avg qpc                  410 -> 1354
+```
+
+The target becomes much more expensive per call even while sampled count falls.
+
+### The winner collapses mostly onto RQ_ONE
+
+At exact `160/161` cardinality:
+
+```text
+                              SMOOTH      HIGH-COST
+winner parent                  2.286 ms    5.743 ms
+RQ_ONE 0x14154C9F0            1.682 ms    4.535 ms
+RQ_PREP 0x14154C370           0.448 ms    1.023 ms
+winner residual                0.022 ms    0.022 ms
+```
+
+`RQ_ONE` is the dominant measured child; `RQ_PREP` is real but secondary and remains in backlog.
+
+### RQ_ONE collapses almost completely onto HEAD_DISPATCH
+
+Across the full accepted run:
+
+```text
+RQ_ONE parent total_qpc      24,363,328
+HEAD_DISPATCH total_qpc      24,324,287
+RQ_ONE residual_qpc              39,041
+```
+
+At exact `156/157` cardinality:
+
+```text
+                              LOW-COST    HIGH-COST
+RQ_ONE parent                  1.855 ms    4.002 ms
+HEAD_DISPATCH                  1.850 ms    3.997 ms
+HEAD samples                     398         386
+HEAD avg qpc                     842        1727
+```
+
+**FACT:** `HEAD_DISPATCH = 1.60.1.7s:0x14154CF60` accounts for about **99.84%** of sampled `RQ_ONE` time in this run.
+
+**FACT:** the slowdown is predominantly per-call, not increased invocation frequency.
+
+## Current static counterparts
+
+```text
+1.60.1.7s:0x1413BB140  <->  1.58.1.4s:0x14120D6B0
+1.60.1.7s:0x14154C9F0  <->  1.58.1.4s:0x1413D7170
+1.60.1.7s:0x14154CF60  <->  1.58.1.4s:0x1413D7700
+1.60.1.7s:0x1402D8D20  <->  1.58.1.4s:0x1401EC530
+```
+
+The current `HEAD_DISPATCH` implementations are both 491 bytes and have very similar high-level structure. The useful question is therefore runtime path/cost behavior, not size alone.
+
+## Current discriminator
+
+`HEAD_DISPATCH` has two normal direct calls to the same downstream routine:
+
+```text
+NOSPLIT  1.60.1.7s:0x14154CFA7 -> 0x1402D8D20
+RANGE    1.60.1.7s:0x14154D048 -> 0x1402D8D20
+```
+
+The active experiment separates those two callsites and the residual body cost.
+
+Decision rule:
+
+```text
+one path dominates + gets slower per call
+  -> recurse into that path / shared target
+
+path mix changes but per-call cost stays stable
+  -> quantify composition effect
+
+both paths rise similarly
+  -> recurse into shared target 0x1402D8D20
+
+child calls stay small while residual grows
+  -> split HEAD_DISPATCH body
+```
+
+No behavior patch is justified yet.
+
+## Secondary validated branch: descriptor/root-binding architecture
+
+The mapped 1.58/1.60 DX12 descriptor/root-binding architecture changed materially. Fixed-profile sampler reservation/copy pressure is real, and sampler-table reuse removes roughly **95%** of targeted allocation/copy work with clean safety counters.
+
+The sustained scene-dependent slowdown still occurs afterward.
+
+**Conclusion:** this is a real optimization/regression component, not the complete explanation.
+
+See [`shader-profile-architecture-delta.md`](shader-profile-architecture-delta.md).
+
+## Runtime-demoted leads
+
+Do not promote these again without new evidence:
+
+- direct sustained-cost theory for `1.60.1.7s:0x14154AAB0`;
+- repeated direct-call probing of `1.60.1.7s:0x1413C1470`;
+- direct sustained-cost theory for `1.60.1.7s:0x1408DC510`;
+- measured WAIT helper as the sustained owner;
+- raw rendergraph cardinality as a sufficient explanation;
+- coarse pass-type/work composition as a sufficient explanation;
+- DirectStorage introduction;
+- broad D3D hooks for performance attribution.
+
+See [`disproven-hypotheses.md`](disproven-hypotheses.md).
 
 ## Whole-corpus diff
+
+The static comparison remains useful for counterpart recovery:
 
 ```text
 1.58 functions:                    66,820
@@ -40,302 +243,12 @@ ambiguous unmatched regions:         3,370
 
 See [`global-diff-summary.md`](global-diff-summary.md).
 
-The global diff remains the static map, but runtime measurement now decides which branches deserve deeper work.
+## Evidence discipline
 
-## Important runtime-demoted static leads
+Public conclusions should distinguish:
 
-- `0x14154AAB0` render-queue copy helper: only **14 direct calls across 24,798 rendered frames**.
-- `0x1413C1470` r_proto boundary: no usable direct-call boundary for the proposed probe.
-- `0x1408DC510` traffic neighbor update: only **85 total calls**, including a heavy-state onset interval with no calls.
+- **FACT** — directly measured or statically verified;
+- **INFERENCE** — the most direct interpretation of measured evidence;
+- **HYPOTHESIS** — a plausible mechanism still awaiting a discriminator.
 
-These findings are why the project no longer promotes candidates merely because a 1.60 function became larger or gained new p3mem/refcount machinery.
-
-## Runtime localization
-
-Measured chain:
-
-```text
-0x1401C5280  outer loop owner
-  -> 0x1401C77C0  LOOP
-       -> 0x1401C6CB0  PACE
-       -> 0x1401D72F0  RENDER
-            -> 0x14011F730  WAIT
-            -> 0x14021FE20  RG_CORE
-```
-
-### v0.2 — active render + other loop work both grow
-
-```text
-             GOOD       HEAVY      DELTA
-LOOP         16.683 ms  20.358 ms  +3.675 ms
-RENDER_ACTIVE11.404 ms  13.507 ms  +2.103 ms
-OTHER         5.253 ms   6.840 ms  +1.586 ms
-WAIT          0.024 ms   0.009 ms  -0.015 ms
-```
-
-PACE is negligible. The measured WAIT helper is sparse and does not own the slowdown.
-
-### v0.3 — broad cost localized
-
-```text
-                              RECOVERED   HEAVY      DELTA
-LOOP                           16.672 ms   19.735 ms  +3.063 ms
-PRE_RENDER_OTHER                6.285 ms    7.752 ms  +1.467 ms
-POST_RENDER_OTHER               0.381 ms    0.380 ms  ~0
-RG_CORE                         6.271 ms    8.964 ms  +2.693 ms
-```
-
-**FACT:** the non-render growth is pre-render work.
-
-**FACT:** among the selected immediate render children, the positive heavy-state growth is concentrated almost entirely in `RG_CORE = 0x14021FE20`.
-
-### v0.4 — raw rendergraph cardinality is not enough
-
-Some heavy episodes do have more rendergraph passes. But matched-cardinality windows show:
-
-```text
-                              SMOOTH      HEAVY
-LOOP                          16.696 ms   19.851 ms
-RG_CORE                        6.253 ms    9.161 ms
-order_count                  192.88      191.16
-pass_count                   193.88      192.16
-```
-
-The sampled synchronization flag was never active (`0 / 86,942`).
-
-**FACT:** total order/pass count is not a sufficient heavy-state discriminator.
-
-### v0.5 — matched composition still differs by several milliseconds
-
-`v0.5` sampled actual execution-order-selected pass types and several exact work-count fields already read by RG_CORE:
-
-```text
-type 1..7 counts
-callback-present count
-pass + 0x1338 raw count
-type-4 pass + 0xDB0 items
-type-7 pass + 0x12D0 refs
-```
-
-The run was structurally clean: `97,290` LOOP calls, `97,287` RENDER/RG_CORE calls, only 3 no-render loops, and zero order mismatch, overlap, reentry, bad-end, thread-mismatch or child-sum accounting violations. Sync remained zero.
-
-Decisive matched pair A:
-
-```text
-                              SMOOTH      HEAVY
-LOOP                          16.568 ms   19.412 ms
-RG_CORE                        6.832 ms    9.825 ms
-order/pass                    159/160     159/160
-T1                              134         134
-T3                                1           1
-T4                               10          10
-T6                                5           5
-T7                                8           8
-callback-present                159         159
-raw +0x1338                     288         282
-type4 items                      10          10
-type7 refs                        7           7
-```
-
-Decisive matched pair B:
-
-```text
-                              SMOOTH      HEAVY
-LOOP                          16.704 ms   20.024 ms
-RG_CORE                        5.126 ms    9.904 ms
-order/pass                    158/159     158/159
-T1                              134         134
-T4                               10          10
-T6                                5           5
-T7                                8           8
-```
-
-A third `157/158` matched pair differs by about `+4.10 ms` in RG_CORE with essentially the same sampled mix/work counts.
-
-**FACT:** the coarse pass composition/work fields measured by v0.5 are not sufficient to explain the heavy-state RG_CORE cost.
-
-**INFERENCE:** broadly the same rendergraph work is becoming materially more expensive to execute; the next useful measurement is elapsed time inside execution paths rather than additional count fields.
-
-See [`rg-core-runtime-localization.md`](rg-core-runtime-localization.md).
-
-### v0.6 — type-1 execution cost is the major measured owner
-
-v0.6 sampled elapsed time in the type-1, type-4 and type-7 helper paths. The run remained structurally clean and retained normal ~16.67 ms windows.
-
-Exact matched order/pass pair:
-
-```text
-                              SMOOTH      HEAVY
-LOOP                          16.678 ms   19.330 ms
-RG_CORE                        5.225 ms    8.196 ms
-order / pass                  168 / 169   168 / 169
-type-1 calls / RG_CORE        ~143.9      ~144.0
-type-1 sample avg              ~16 us      ~32 us
-type-1 estimated/RG_CORE       2.373 ms     4.650 ms
-type-4 estimated/RG_CORE       0.004 ms     0.005 ms
-type-7 estimated/RG_CORE       0.000 ms     0.000 ms
-```
-
-**FACT:** type-1 helper `1.60.1.7s:0x14021F560` owns a large fraction of the measured RG_CORE heavy-state delta.
-
-**FACT:** this is not explained by more type-1 invocations; call count is essentially unchanged while sampled per-call cost rises strongly.
-
-**FACT:** type 4 and type 7 are demoted as major owners in this episode.
-
-## Current RG_CORE branch targets
-
-Static inspection of `0x14021FE20` identifies three clean direct helper paths:
-
-```text
-0x14021F560  type-1 helper
-0x14021F780  type-4 helper
-0x1402DE540  type-7 per-reference helper
-```
-
-Type 1 dominates the observed pass mix. Its helper performs device-facing work and invokes a pass-specific callback when present, so it is the strongest first timing discriminator without assuming it is the answer.
-
-The type-4 helper processes its item list and callback/device work. The type-7 helper executes once per type-7 reference.
-
-### v0.7.1 — type-1 cost collapses onto the pass callback
-
-The v0.7.1 drive did not reproduce the earlier canonical sustained 19–21+ ms state, so it does not replace the v0.6 heavy-state budget. It does answer the narrower intra-T1 question cleanly.
-
-At exact matched `order/pass = 151/152`:
-
-```text
-                              LOW-COST    HIGH-COST
-RG_CORE                        4.681 ms    9.393 ms
-type-1 sample avg                206 qpc      603 qpc
-device +0x208                      0 qpc        0 qpc
-callback +0x8                    200 qpc      596 qpc
-pre-tail                         204 qpc      601 qpc
-derived final tail                 2 qpc        2 qpc
-```
-
-Across accepted full windows, `corr(type-1, callback) ≈ 0.9995`.
-
-**FACT:** nearly all sampled type-1 time and type-1 cost variation is inside the indirect pass callback at `1.60.1.7s:0x14021F73C`.
-
-**FACT:** the measured device +0x208 and final +0x108 tail paths are negligible compared with the callback.
-
-### v0.8 — one callback target, still not the final implementation
-
-v0.8 reproduced the sustained heavy scene state and found that **all 107,739 sampled T1 callbacks** targeted exactly one address:
-
-```text
-1.60.1.7s:0x140226A50
-```
-
-Exact matched `order/pass = 159/160`:
-
-```text
-                              SMOOTH      HEAVY
-LOOP                          16.673 ms   21.716 ms
-RG_CORE                        5.265 ms   11.121 ms
-type-1 sample avg                207 qpc      601 qpc
-outer callback avg               203 qpc      597 qpc
-```
-
-Targeted static inspection shows that `0x140226A50` is only:
-
-```text
-MOV RCX,[RCX+0x110]
-MOV RAX,[RCX]
-JMP qword ptr [RAX+0x8]
-```
-
-So there is no outer callback-target composition shift. The entire sampled population goes through one thunk, and the substantive implementation is one nested vtable dispatch deeper.
-
-### v0.9 — dominant nested implementation
-
-v0.9 identified `0x1413BD3F0 -> 0x1413BB140` as the dominant nested T1 callback implementation, with about 60.6% of sampled T1 time and strong cost correlation.
-
-### v0.10 — winner cost is dominated by RQ_ONE
-
-v0.10 localized most winner cost variation to `RQ_ONE = 0x14154C9F0`, with `RQ_PREP` secondary and winner-body residual negligible.
-
-### v0.11 — RQ_ONE cost is effectively all HEAD_DISPATCH
-
-v0.11 split four direct callsites inside RQ_ONE.
-
-```text
-RQ_ONE parent total_qpc      24,363,328
-HEAD_DISPATCH total_qpc      24,324,287
-VIEW_UPDATE calls                     0
-CMD_ALLOC calls                       0
-INNER_DISPATCH calls                  0
-RQ_ONE residual_qpc              39,041
-```
-
-At exact `156/157` cardinality:
-
-```text
-RQ_ONE parent    1.855 -> 4.002 ms
-HEAD_DISPATCH    1.850 -> 3.997 ms
-HEAD samples       398 -> 386
-HEAD avg qpc       842 -> 1727
-```
-
-**FACT:** `HEAD_DISPATCH = 1.60.1.7s:0x14154CF60` accounts for about 99.84% of measured sampled RQ_ONE time.
-
-**FACT:** the slowdown is per-call, not increased invocation frequency.
-
-Static counterpart:
-
-```text
-1.60 0x14154CF60 <-> 1.58 0x1413D7700
-```
-
-## Immediate technical direction
-
-Split the two normal direct calls from HEAD_DISPATCH to `0x1402D8D20`:
-
-```text
-NOSPLIT 0x14154CFA7 -> 0x1402D8D20
-RANGE   0x14154D048 -> 0x1402D8D20
-+ HEAD_DISPATCH residual
-```
-
-Then recurse only into the measured path/shared target. `RQ_PREP` and `PRE_RENDER_OTHER` remain backlog branches.
-
-No behavior patch is justified yet.
-
-## Descriptor/root-binding architecture
-
-The mapped 1.58/1.60 DX12 descriptor/root-binding difference remains confirmed. `NemoDX12SamplerAllocReuse` safely removes roughly **95%** of targeted sampler allocation/copy pressure, but sustained heavy-scene slowdown still occurs with that optimization active.
-
-Therefore the descriptor branch is a real optimization/regression component, not a complete explanation. See [`shader-profile-architecture-delta.md`](shader-profile-architecture-delta.md).
-
-## Broad 1.60 p3mem migration
-
-The global corpus still shows the broad allocator/scope migration:
-
-```text
-direct _malloc_base calls: 1.58 = 4,212; 1.60 = 260
-1.60 p3_alloc path:      0x140117240  (~1,485 incoming edges)
-1.60 lifetime/free path: 0x140117400  (~3,828 incoming edges)
-```
-
-This is structural context, not permission to hook or patch p3mem globally.
-
-## Demoted / insufficient explanations
-
-Do not promote these again without new evidence:
-
-- DirectStorage introduction
-- six-shader tuple/profile collision
-- map-dump/I/O SRW-lock branch
-- TAA history-init growth as sustained cause
-- editor/load KDOP/vegetation candidates
-- collision-init traffic semaphore candidate
-- setup/config/UI/unit/model candidates
-- direct-cost theory for `0x14154AAB0`
-- repeated direct-call probing of `0x1413C1470`
-- direct-cost theory for `0x1408DC510`
-- measured WAIT helper as sustained owner
-- raw RG_CORE pass/order count as a sufficient explanation
-- v0.5 coarse pass mix / measured work-count fields as a sufficient explanation
-
-## Telemetry caveat
-
-`SCS frame_start` is not guaranteed to be 1:1 with physically rendered frames. Prefer rendered-frametime timing, wall time, synchronized counters and narrow aggregate duration measurements.
+Addresses are build-specific. Never carry them between versions without re-identification.
