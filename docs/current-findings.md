@@ -196,16 +196,39 @@ Type 1 dominates the observed pass mix. Its helper performs device-facing work a
 
 The type-4 helper processes its item list and callback/device work. The type-7 helper executes once per type-7 reference.
 
-## Immediate technical direction
+### v0.7.1 — type-1 cost collapses onto the pass callback
 
-`v0.7` recurses only inside the measured type-1 owner. Internal observations are aligned to the same sampled type-1 calls and separate the device-facing +0x208 call, the pass callback, the pre-tail body, and a derived final +0x108 tail cost.
+The v0.7.1 drive did not reproduce the earlier canonical sustained 19–21+ ms state, so it does not replace the v0.6 heavy-state budget. It does answer the narrower intra-T1 question cleanly.
+
+At exact matched `order/pass = 151/152`:
 
 ```text
-matched smooth vs heavy
-  -> compare aligned internal type-1 durations
-  -> recurse only into the component that owns the delta
-  -> map the measured hotspot to its 1.58 ↔ 1.60 counterpart
-  -> patch only after a concrete missing-ms budget is localized
+                              LOW-COST    HIGH-COST
+RG_CORE                        4.681 ms    9.393 ms
+type-1 sample avg                206 qpc      603 qpc
+device +0x208                      0 qpc        0 qpc
+callback +0x8                    200 qpc      596 qpc
+pre-tail                         204 qpc      601 qpc
+derived final tail                 2 qpc        2 qpc
+```
+
+Across accepted full windows, `corr(type-1, callback) ≈ 0.9995`.
+
+**FACT:** nearly all sampled type-1 time and type-1 cost variation is inside the indirect pass callback at `1.60.1.7s:0x14021F73C`.
+
+**FACT:** the measured device +0x208 and final +0x108 tail paths are negligible compared with the callback.
+
+## Immediate technical direction
+
+`v0.8` records the actual indirect callback function target on the same sampled type-1 calls and aggregates sample count/duration per target.
+
+```text
+sampled type-1 callback
+  -> identify exact indirect target implementation(s)
+  -> separate target-composition shifts from per-target slowdown
+  -> recurse only into the measured target that owns the cost
+  -> map that target to 1.58 ↔ 1.60
+  -> patch only after the missing-ms mechanism is concrete
 ```
 
 No behavior patch is justified yet.
