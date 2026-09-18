@@ -1,6 +1,6 @@
 # RG_CORE runtime localization
 
-Updated: **2026-09-16**
+Updated: **2026-09-18**
 
 This note tracks the runtime narrowing of the scene-dependent CPU slowdown into the rendergraph execution stage and records the discriminators that have already been tested.
 
@@ -182,16 +182,47 @@ The type-4 helper consumes the type-4 item list and also invokes pass/device wor
 
 The type-7 helper is called once per reference on the type-7 path.
 
-## v0.6 discriminator
+## v0.6 — type-1 helper owns a large fraction of the delta
 
-The next probe keeps v0.3 timing and v0.4 cardinality, removes the v0.5 pass-mix scan, and samples only every 16th execution of the three direct helper callsites above.
+The v0.6 run passed all safety/accounting checks and preserved ordinary ~16.67 ms windows. It sampled every 16th execution of the three direct helpers.
 
-The branch timings are nested inside RG_CORE and are **not** added to the RENDER child sum, preserving the existing non-overlap accounting model.
+The decisive result again comes from exact matched cardinality:
 
-Acceptance logic:
+```text
+order / pass                  168 / 169   168 / 169
+                              SMOOTH      HEAVY
+LOOP                          16.678 ms   19.330 ms
+RG_CORE                        5.225 ms    8.196 ms
+type-1 calls / RG_CORE        ~143.9      ~144.0
+type-1 sample avg              ~16 us      ~32 us
+type-1 estimated/RG_CORE       2.373 ms     4.650 ms
+type-4 estimated/RG_CORE       0.004 ms     0.005 ms
+type-7 estimated/RG_CORE       0.000 ms     0.000 ms
+```
 
-- if type-1 timing owns most of the smooth-vs-heavy RG_CORE delta, recurse inside `0x14021F560` (especially callback/device-facing work);
-- if type 4 or type 7 separates the states, recurse only into that branch;
-- if none of the three explains the missing milliseconds, treat the remaining RG_CORE body/tail/type-2/3/5/6 paths as the residual and move to targeted branch timing or differential CPU stack sampling.
+So RG_CORE rises by about **+2.97 ms** while type-1 call count is effectively unchanged. The sampled type-1 contribution rises by about **+2.28 ms**, roughly three quarters of that RG_CORE delta in this pair. Type 4 and type 7 remain effectively flat.
+
+The same direction repeats in exact-cardinality groups `162/163`, `169/170`, `171/172`, and `173/174`.
+
+**FACT:** the type-1 helper at `1.60.1.7s:0x14021F560` is a major owner of the heavy-state RG_CORE cost.
+
+**FACT:** this is not simply more type-1 calls. At matched cardinality, effectively the same number of type-1 invocations becomes substantially more expensive per call.
+
+**FACT:** type-4 and type-7 helpers are demoted as major owners for this episode.
+
+**INFERENCE:** the next useful discriminator is inside the type-1 helper itself, especially its callback/device-facing work.
+
+## v0.7 direction
+
+The next probe keeps the accepted parent/cardinality/type-1/type-4/type-7 timing and aligns internal measurements to the same sampled type-1 calls. It separates:
+
+```text
+device-facing +0x208 call
+pass-specific callback
+elapsed pre-tail body
+derived final tail +0x108 cost
+```
+
+The final device operation is a true tail jump and must remain a jump; its cost is derived rather than instrumented by converting it to a call.
 
 No behavior patch is justified yet.
