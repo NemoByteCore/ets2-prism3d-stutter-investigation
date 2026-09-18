@@ -15,10 +15,11 @@ main loop
           -> nested winner 0x1413BB140
             -> RQ_ONE 0x14154C9F0
               -> HEAD_DISPATCH 0x14154CF60
-                -> 0x1402D8D20
+                -> NOSPLIT 0x14154CFA7
+                  -> 0x1402D8D20
 ```
 
-The current question is no longer "which subsystem is slow?" but whether the cost inside `HEAD_DISPATCH` comes from its no-split path or ranged path to the shared downstream routine `1.60.1.7s:0x1402D8D20`.
+The current question is no longer "which subsystem is slow?" The ranged path did not execute in the accepted sample; essentially all measured `HEAD_DISPATCH` cost came through the no-split callsite into `1.60.1.7s:0x1402D8D20`. The next step is to split that downstream routine internally.
 
 ## Strongest runtime evidence
 
@@ -45,6 +46,17 @@ RQ_ONE residual                0.005 ms    0.005 ms
 ```
 
 Across the full accepted run, `HEAD_DISPATCH` accounts for about **99.84%** of sampled `RQ_ONE` time, while sampled call count can fall as per-call cost rises. This is strong evidence for a per-call slowdown rather than simply more invocations.
+
+The next split was even cleaner:
+
+```text
+HEAD_DISPATCH sampled          32,359
+NOSPLIT calls                  32,359
+RANGE calls                         0
+HEAD residual_qpc              86,723
+```
+
+At exact `143/144` cardinality, `HEAD_DISPATCH` rises `2.585 -> 3.869 ms` and the no-split call rises `2.578 -> 3.863 ms`, while sampled calls fall `459 -> 407`.
 
 ## What has already been ruled down
 
