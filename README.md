@@ -19,7 +19,7 @@ main loop
                   -> 0x1402D8D20
 ```
 
-The current question is no longer "which subsystem is slow?" The ranged path did not execute in the accepted sample; essentially all measured `HEAD_DISPATCH` cost came through the no-split callsite into `1.60.1.7s:0x1402D8D20`. The next step is to split that downstream routine internally.
+The current question has shifted again: the downstream routine is not simply doing fixed work much more slowly. At matched rendergraph cardinality, heavy windows can carry **several times more render items per downstream call**. The active question is now which queue object(s) produce that item-count growth.
 
 ## Strongest runtime evidence
 
@@ -47,16 +47,20 @@ RQ_ONE residual                0.005 ms    0.005 ms
 
 Across the full accepted run, `HEAD_DISPATCH` accounts for about **99.84%** of sampled `RQ_ONE` time, while sampled call count can fall as per-call cost rises. This is strong evidence for a per-call slowdown rather than simply more invocations.
 
-The next split was even cleaner:
+The downstream split exposed the mechanism more clearly. At exact matched `order/pass = 168/169`:
 
 ```text
-HEAD_DISPATCH sampled          32,359
-NOSPLIT calls                  32,359
-RANGE calls                         0
-HEAD residual_qpc              86,723
+                              LOW-COST    HIGH-COST
+downstream parent              1.520 ms    5.796 ms
+sampled parent calls             488         443
+processed render items        29,641      92,128
+items / parent                  60.7       208.0
+BUNDLE_BUILD                    0.856 ms    3.341 ms
 ```
 
-At exact `143/144` cardinality, `HEAD_DISPATCH` rises `2.585 -> 3.869 ms` and the no-split call rises `2.578 -> 3.863 ms`, while sampled calls fall `459 -> 407`.
+The parent gets about `3.6x` more expensive per sampled call while processing about `3.4x` more items. Normalized parent cost per item rises only about **6%**. The per-item `BUNDLE_BUILD = 0x1402D7D70` timing stays roughly flat while its total cost scales with item count.
+
+This means most of the earlier apparent "per-call slowdown" is actually **more render-item work inside each call**, not constant work suddenly taking 3–4x longer.
 
 ## What has already been ruled down
 
