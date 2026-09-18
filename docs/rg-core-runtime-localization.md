@@ -1,6 +1,6 @@
 # RG_CORE runtime localization
 
-Updated: **2026-09-18**
+Updated: **2026-09-19**
 
 This document keeps only the accepted evidence ladder for the render-side branch. Detailed probe-version chronology is intentionally omitted; the public question is **what has been measured, what was ruled down, and where the current leaf is**.
 
@@ -45,7 +45,9 @@ The measured WAIT helper is not the owner of this increase.
 | Pass callback | site `0x14021F73C` | T1 `206 -> 603 qpc`, callback `200 -> 596 qpc` | T1 variation is almost entirely callback time |
 | Nested implementation | `0x1413BD3F0 -> 0x1413BB140` | Estimated contribution `1.421 -> 4.661 ms` while samples fall `649 -> 583` | Dominant callback implementation gets slower per call |
 | Winner child | `RQ_ONE 0x14154C9F0` | `1.682 -> 4.535 ms` in exact `160/161` comparison | Dominant child of winner |
-| RQ_ONE child | `HEAD_DISPATCH 0x14154CF60` | ~99.84% of sampled RQ_ONE time | Collapses onto no-split path |\n| HEAD path | `0x14154CFA7 -> 0x1402D8D20` | 32,359 no-split samples, 0 range samples, negligible residual | Current measured leaf |
+| RQ_ONE child | `HEAD_DISPATCH 0x14154CF60` | ~99.84% of sampled RQ_ONE time | Collapses onto no-split path |
+| HEAD path | `0x14154CFA7 -> 0x1402D8D20` | 32,359 no-split samples, 0 range samples, negligible residual | Downstream owner |
+| Downstream workload | per-item `BUNDLE_BUILD 0x1402D7D70` | item count/call rises ~3.4x in matched 168/169 pair while qpc/item rises only ~6% | Current mechanism is larger item batches |
 
 ## Why pass count is not enough
 
@@ -173,45 +175,47 @@ corr(RQ_ONE parent, HEAD_DISPATCH) ~= 0.99999977
 
 The current `HEAD_DISPATCH` counterpart is the same size in both builds (`491` bytes) and has very similar high-level control flow.
 
-## Current discriminator
+## Current mechanism: item workload inside the downstream call
 
-Splitting HEAD_DISPATCH by path produced:
-
-```text
-HEAD sampled                32,359
-NOSPLIT calls               32,359
-RANGE calls                      0
-HEAD residual_qpc           86,723
-```
-
-Exact `143/144` cardinality:
+Splitting `0x1402D8D20` produced these full-run shares:
 
 ```text
-HEAD_DISPATCH             2.585 -> 3.869 ms
-NOSPLIT_DISPATCH          2.578 -> 3.863 ms
-samples                     459 -> 407
-avg qpc                     958 -> 1512
-residual                  ~0.007 ms flat
+BUNDLE_BUILD 0x1402D7D70   55.90%
+residual                    35.69%
+SPECIAL                      4.79%
+CMD_ALLOC                    2.84%
+other direct children        <1%
 ```
 
-Across normal windows:
+The decisive observation is that `BUNDLE_BUILD` and `CMD_ALLOC` run once per render item. Their call counts reveal how much item work the sampled downstream calls contain.
+
+Exact matched `order/pass = 168/169`:
 
 ```text
-corr(HEAD_DISPATCH, NOSPLIT_DISPATCH) ~= 0.99999924
+                              LOW-COST    HIGH-COST
+downstream parent              1.520 ms    5.796 ms
+sampled parent calls             488         443
+BUNDLE_BUILD calls/items      29,641      92,128
+items / parent                  60.7       208.0
+BUNDLE_BUILD                    0.856 ms    3.341 ms
+residual                        0.537 ms    2.016 ms
 ```
 
-**FACT:** the ranged path is absent from the accepted sampled population.
-
-**FACT:** the no-split path inherits essentially all measured HEAD_DISPATCH cost and variation.
-
-The current leaf is therefore the shared downstream implementation:
+Normalized:
 
 ```text
-1.60.1.7s:0x1402D8D20
-1.58.1.4s:0x1401EC530
+parent qpc/call   ~584 -> ~2118
+items/call        ~60.7 -> ~208.0
+parent qpc/item   ~9.62 -> ~10.19
 ```
 
-The next discriminator splits direct children inside `0x1402D8D20`; any remaining indirect device call/body work stays visible as residual.
+**FACT:** most of the apparent downstream per-call slowdown is explained by much larger render-item batches.
+
+**FACT:** `BUNDLE_BUILD` per-item timing remains roughly flat while total BUNDLE_BUILD cost scales with item count.
+
+**FACT:** rendergraph pass/order count is therefore too coarse even when exactly matched; queue-level item count is the more relevant workload variable at this leaf.
+
+The next discriminator attributes item count and measured HEAD time by queue pointer. The goal is to determine whether one queue object owns the growth or whether many queues expand together.
 No behavior patch is justified yet.
 
 ## Secondary measured branches
