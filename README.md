@@ -1,153 +1,39 @@
 # ETS2 / Prism3D stutter investigation
 
-Active reverse-engineering investigation of scene-dependent CPU-side stutter in **Euro Truck Simulator 2 1.60.1.7s** using the native DX12 renderer.
+Evidence-driven reverse engineering of a scene-dependent CPU-side slowdown in **Euro Truck Simulator 2 1.60.1.7s** using the native DX12 renderer.
 
-> **Status:** runtime localization has narrowed the render-side slowdown to `HEAD_DISPATCH = 1.60.1.7s:0x14154CF60`, reached through `RG_CORE -> T1_HELPER -> pass callback -> nested winner -> RQ_ONE`. In `v0.11`, HEAD_DISPATCH accounts for about **99.84%** of sampled RQ_ONE time; at exact `156/157` cardinality RQ_ONE rises `1.855 -> 4.002 ms` and HEAD_DISPATCH rises `1.850 -> 3.997 ms` while sampled call count falls. The next discriminator splits its two path-specific calls to `0x1402D8D20`.
+## Current status
 
-## What is being investigated
-
-On the tested system, light scenes can hold roughly **16.67 ms / 60 FPS**, while heavier scene compositions can move into roughly **19–25 ms**. The slower state can be sustained and strongly scene-dependent; unload/ferry/teleport transitions can sometimes restore ~16.67 ms without restarting the game.
-
-Earlier runtime work showed that the sustained slowdown is not primarily explained by the measured DXGI/fence/wait gates. Slow regions mainly contain more active CPU work rather than one obvious fixed stall.
-
-## Whole-corpus diff status
+The render-side slowdown has been narrowed from the whole frame to one small dispatch path:
 
 ```text
-1.58 functions: 66,820
-1.60 functions: 68,834
-confirmed counterparts: 58,589
-coverage: 87.68% / 85.12%
-materially changed confirmed pairs: 9,308
-strong anchored 1.60-only: 597
-strong anchored 1.58-only: 375
-ambiguous unmatched regions: 3,370
+main loop
+  -> RENDER
+    -> RG_CORE 0x14021FE20
+      -> T1 helper 0x14021F560
+        -> pass callback 0x14021F73C
+          -> nested winner 0x1413BB140
+            -> RQ_ONE 0x14154C9F0
+              -> HEAD_DISPATCH 0x14154CF60
+                -> 0x1402D8D20
 ```
 
-See [`docs/global-diff-summary.md`](docs/global-diff-summary.md).
+The current question is no longer "which subsystem is slow?" but whether the cost inside `HEAD_DISPATCH` comes from its no-split path or ranged path to the shared downstream routine `1.60.1.7s:0x1402D8D20`.
 
-## Why runtime localization replaced static candidate roulette
+## Strongest runtime evidence
 
-Several attractive isolated static candidates were directly demoted:
+Light scenes can hold roughly **16.67 ms / 60 FPS** while heavier scene compositions can sustain roughly **19–25 ms**.
 
-- `render_queue_set_t` copy helper `0x14154AAB0`: only **14 direct calls across 24,798 rendered frames**;
-- `r_proto` boundary `0x1413C1470`: no direct-call boundary for the proposed experiment;
-- `traffic_trajectory_t::update_neighbors_bits` `0x1408DC510`: only **85 total calls**, including a long heavy-state onset interval with no calls.
-
-The static mappings remain useful, but runtime evidence now decides where to recurse.
-
-## Current measured chain
-
-```text
-0x1401C5280  outer loop owner
-    -> 0x1401C77C0  main-loop iteration
-          -> 0x1401C6CB0  PACE / frame-clock bookkeeping
-          -> 0x1401D72F0  rendergraph / present coordinator
-                -> 0x14011F730  measured WAIT helper
-                -> 0x14021FE20  RG_CORE / rendergraph execution
-```
-
-### v0.2 — coarse active split
-
-```text
-             GOOD       HEAVY      DELTA
-LOOP         16.683 ms  20.358 ms  +3.675 ms
-RENDER_ACTIVE11.404 ms  13.507 ms  +2.103 ms
-OTHER         5.253 ms   6.840 ms  +1.586 ms
-WAIT          0.024 ms   0.009 ms  -0.015 ms
-```
-
-The measured sleep/spin WAIT helper does not own the slowdown.
-
-### v0.3 — localization to PRE_RENDER_OTHER + RG_CORE
-
-A clean sustained heavy episode versus recovered ordinary gameplay:
+A broad phase split showed two independent growth areas:
 
 ```text
                               RECOVERED   HEAVY      DELTA
 LOOP                           16.672 ms   19.735 ms  +3.063 ms
 PRE_RENDER_OTHER                6.285 ms    7.752 ms  +1.467 ms
-POST_RENDER_OTHER               0.381 ms    0.380 ms  ~0
 RG_CORE                         6.271 ms    8.964 ms  +2.693 ms
 ```
 
-Among the selected immediate RENDER children, essentially all positive growth localized to `RG_CORE`. Non-render growth localized to pre-render work.
-
-### v0.4 — pass count can rise, but count is not the discriminator
-
-Across clean heavy windows, order/pass counts often rise substantially. But matched-cardinality windows are decisive:
-
-```text
-                              SMOOTH      HEAVY
-LOOP                          16.696 ms   19.851 ms
-RG_CORE                        6.253 ms    9.161 ms
-order_count                  192.88      191.16
-pass_count                   193.88      192.16
-```
-
-The sampled sync flag was never active (`0 / 86,942`).
-
-### v0.5 — even coarse pass composition matches
-
-`v0.5` sampled actual execution-order-selected pass types and exact work-count fields already consumed by RG_CORE.
-
-One matched pair:
-
-```text
-                              SMOOTH      HEAVY
-LOOP                          16.568 ms   19.412 ms
-RG_CORE                        6.832 ms    9.825 ms
-order / pass                  159 / 160   159 / 160
- type 1                         134         134
- type 3                           1           1
- type 4                          10          10
- type 6                           5           5
- type 7                           8           8
- callback-present               159         159
- raw +0x1338                    288         282
- type4 items                     10          10
- type7 refs                       7           7
-```
-
-Another exact `158 / 159` matched pair has `RG_CORE` at roughly **5.13 ms smooth vs 9.90 ms heavy** while the sampled type mix remains essentially the same.
-
-**Current conclusion:** the same broad rendergraph workload is becoming materially more expensive to execute. More pass-count fields are unlikely to answer why.
-
-See [`docs/rg-core-runtime-localization.md`](docs/rg-core-runtime-localization.md).
-
-## v0.6 result — type-1 helper wins
-
-At exact matched order/pass cardinality `168 / 169`:
-
-```text
-                              SMOOTH      HEAVY
-RG_CORE                        5.225 ms    8.196 ms
-type-1 calls / RG_CORE        ~143.9      ~144.0
-type-1 sample avg              ~16 us      ~32 us
-type-1 estimated/RG_CORE       2.373 ms     4.650 ms
-type-4 estimated/RG_CORE       0.004 ms     0.005 ms
-type-7 estimated/RG_CORE       0.000 ms     0.000 ms
-```
-
-The type-1 path explains about **2.28 ms of the 2.97 ms RG_CORE increase** in this exact pair, while type-4/type-7 timing is effectively flat. The same direction repeats across several other exact-cardinality groups.
-
-## v0.11 result — RQ_ONE collapses onto HEAD_DISPATCH
-
-v0.11 split the four selected direct callsites inside `RQ_ONE = 0x14154C9F0`.
-
-Across the full run:
-
-```text
-RQ_ONE parent total_qpc      24,363,328
-HEAD_DISPATCH total_qpc      24,324,287
-VIEW_UPDATE calls                     0
-CMD_ALLOC calls                       0
-INNER_DISPATCH calls                  0
-RQ_ONE residual_qpc              39,041
-```
-
-So HEAD_DISPATCH accounts for about **99.84%** of measured sampled RQ_ONE time.
-
-At exact matched `order/pass = 156/157`:
+The current render-side leaf is much narrower. At exact matched `order/pass = 156/157`:
 
 ```text
                               LOW-COST    HIGH-COST
@@ -158,63 +44,56 @@ HEAD avg qpc                     842        1727
 RQ_ONE residual                0.005 ms    0.005 ms
 ```
 
-Across normal windows, `corr(RQ_ONE parent, HEAD_DISPATCH) ≈ 0.9999998`.
+Across the full accepted run, `HEAD_DISPATCH` accounts for about **99.84%** of sampled `RQ_ONE` time, while sampled call count can fall as per-call cost rises. This is strong evidence for a per-call slowdown rather than simply more invocations.
 
-**FACT:** the accepted sampled RQ_ONE path is effectively entirely `HEAD_DISPATCH = 0x14154CF60`.
+## What has already been ruled down
 
-**FACT:** its slowdown is per-call, not increased invocation count.
+Runtime evidence has demoted several attractive explanations:
 
-Static mapping:
+- the measured WAIT helper does not own the sustained slowdown;
+- raw rendergraph pass/order count is not sufficient;
+- coarse pass-type/work composition is not sufficient;
+- type-4 and type-7 helper paths are negligible in the accepted RG_CORE split;
+- direct execution of `1.60.1.7s:0x14154AAB0` is far too sparse;
+- the proposed direct-call boundary at `1.60.1.7s:0x1413C1470` has no direct callsites;
+- `traffic_trajectory_t::update_neighbors_bits` is too sparse to own the sustained frame budget.
+
+See [`docs/disproven-hypotheses.md`](docs/disproven-hypotheses.md).
+
+## Static comparison
+
+The current measured functions have close static counterparts in the 1.58 reference build:
 
 ```text
-1.60 0x14154CF60  <->  1.58 0x1413D7700
+1.60.1.7s:0x14154C9F0  <->  1.58.1.4s:0x1413D7170
+1.60.1.7s:0x14154CF60  <->  1.58.1.4s:0x1413D7700
+1.60.1.7s:0x1402D8D20  <->  1.58.1.4s:0x1401EC530
 ```
 
-Both are 491-byte functions. The 1.60 function has two normal direct calls to `0x1402D8D20`, corresponding to the no-split and ranged paths.
+The whole-corpus static diff remains the map; runtime measurement decides where to recurse.
 
-## Current next step — split HEAD_DISPATCH
+## Secondary findings kept for later
 
-The next probe times these two callsites separately:
+Two real branches are intentionally not being opened in parallel:
 
-```text
-0x14154CFA7 -> 0x1402D8D20   no-split path
-0x14154D048 -> 0x1402D8D20   ranged path
-```
-
-and reports HEAD_DISPATCH residual.
-
-No behavior patch is justified yet.
-
-## Descriptor/root-binding branch
-
-The mapped 1.58/1.60 DX12 binding architecture difference remains confirmed. Runtime probing found large fixed-capacity over-reservation, and `NemoDX12SamplerAllocReuse` safely avoids roughly **95%** of targeted sampler allocation/copy pressure.
-
-Sustained heavy-scene slowdown still occurs with that optimization active, so this is a real optimization/regression component, **not a complete explanation**.
+- `PRE_RENDER_OTHER` contributes roughly +1.5 ms in the accepted broad split;
+- the DX12 descriptor/root-binding branch contains real fixed-capacity sampler pressure, and sampler-table reuse removes roughly 95% of targeted allocation/copy work, but does **not** eliminate the broader heavy-state slowdown.
 
 See [`docs/shader-profile-architecture-delta.md`](docs/shader-profile-architecture-delta.md).
 
-## Help wanted
+## Read this first
 
-Useful outside contributions include independent reproduction, review of the `PRE_RENDER_OTHER + RG_CORE` localization, interpretation of the RG_CORE branch helpers, low-overhead Windows x64 sampling ideas, and corrections to build-specific mappings.
-
-Please keep **FACT / INFERENCE / HYPOTHESIS** separate and identify the exact build for every address. See [`CONTRIBUTING.md`](CONTRIBUTING.md).
-
-## Start here
-
-- [`docs/current-findings.md`](docs/current-findings.md)
-- [`docs/runtime-phase-localization.md`](docs/runtime-phase-localization.md)
-- [`docs/rg-core-runtime-localization.md`](docs/rg-core-runtime-localization.md)
-- [`docs/global-diff-summary.md`](docs/global-diff-summary.md)
-- [`docs/function-map.md`](docs/function-map.md)
-- [`docs/shader-profile-architecture-delta.md`](docs/shader-profile-architecture-delta.md)
-- [`docs/methodology.md`](docs/methodology.md)
-- [`docs/experiments.md`](docs/experiments.md)
-- [`docs/disproven-hypotheses.md`](docs/disproven-hypotheses.md)
-- [`pseudocode/`](pseudocode/)
+- [`docs/current-findings.md`](docs/current-findings.md) — current technical snapshot
+- [`docs/rg-core-runtime-localization.md`](docs/rg-core-runtime-localization.md) — condensed evidence ladder for the render branch
+- [`docs/runtime-phase-localization.md`](docs/runtime-phase-localization.md) — broad frame-budget localization
+- [`docs/global-diff-summary.md`](docs/global-diff-summary.md) — 1.58 ↔ 1.60 corpus map
+- [`docs/methodology.md`](docs/methodology.md) — measurement rules
+- [`docs/disproven-hypotheses.md`](docs/disproven-hypotheses.md) — branches not to repeat
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — useful ways to help
 
 ## Build policy
 
-### Runtime / test / fix target
+Runtime / profiling / patch target:
 
 ```text
 ETS2:      1.60.1.7s
@@ -223,7 +102,7 @@ renderer:  native DX12
 SHA-256:   1D61BA2337E4D8CED85A06E10566A4DF064A2A0919CCD5E51561972D2A04255E
 ```
 
-### Static-only reference
+Static-only reference:
 
 ```text
 ETS2:      1.58.1.4s
@@ -232,6 +111,6 @@ SHA-256:   AB9785331BF9970542C61A0108A4E677C9F7C00FD316D4C0F9AB116F6BE6C234
 
 **1.58.1.4s is never run in this investigation.**
 
-## Evidence / publication policy
+## Publication policy
 
-No SCS executables, proprietary assets, giant raw decompiler dumps, private handoffs or local-only data are published here. This repository contains original analysis, normalized pseudocode, mappings and reproducible research notes.
+No SCS executables, proprietary assets, giant raw decompiler dumps, private handoffs or local-only data are published here. Public notes contain original analysis, normalized pseudocode, mappings and reproducible measurements.
