@@ -19,7 +19,9 @@ main loop
                   -> 0x1402D8D20
 ```
 
-The downstream routine is not simply doing fixed work much more slowly. At matched rendergraph cardinality, heavy windows can carry **several times more render items per downstream call**. Raw queue-data addresses churn too aggressively to identify the producer directly, so the active experiment now attributes workload by stable queue-data index and descriptor metadata.
+The downstream routine is not simply doing fixed work much more slowly. At matched rendergraph cardinality, heavy windows can carry **several times more render items per downstream call**. Stable queue attribution now shows one queue class carrying about **81% of sampled item work overall**, while also confirming that scene composition can shift growth into other queues.
+
+The accepted downstream path also reaches the native-DX12 descriptor builder through the indirect call at `0x1402D8F6C [vtable+0x260]`. The current narrow experiment measures that descriptor-builder cost by stable queue and separates resource-reservation from sampler-reservation pressure without changing rendering behavior.
 
 ## Strongest runtime evidence
 
@@ -64,7 +66,9 @@ This means most of the earlier apparent "per-call slowdown" is actually **more r
 
 A follow-up queue-work run strengthened that result: across ordinary windows, downstream cost per rendered frame correlates with average queue item count at about `0.97`. Exact-cardinality examples show item averages such as `76 -> 201`, `72 -> 186`, and `49 -> 160` while sampled queue-call count often falls.
 
-Raw `queue_data_t*` addresses are not stable identities: most sampled calls use transient addresses. Static recovery at the accepted HEAD callsite shows that a stable queue-data index can instead be derived from the active render-queue-set owner, which is the current discriminator.
+Raw `queue_data_t*` addresses are not stable identities: most sampled calls use transient addresses. Stable indexing from the active render-queue-set owner solved that problem: across ordinary windows, 113,391 identities validated with 0 invalid derivations and 0 bucket overflow. `queue_index 0 / tag 11` carries about 80.7% of item work overall, with total item workload and queue-0 workload correlating at about `0.973`.
+
+This does **not** establish that the extra items are duplicates or invalid geometry, so the project is not pursuing a blind queue cap.
 
 ## What has already been ruled down
 
@@ -92,12 +96,26 @@ The current measured functions have close static counterparts in the 1.58 refere
 
 The whole-corpus static diff remains the map; runtime measurement decides where to recurse.
 
+The accepted downstream path now reconnects directly to the mapped descriptor architecture:
+
+```text
+0x1402D8D20
+  -> 0x1402D8F6C [vtable+0x260]
+    -> native DX12 0x1402942D0
+       RESOURCE 0x1402943FF -> 0x14028F070
+       SAMPLER  0x140294438 -> 0x14028F070
+```
+
+The known descriptor-builder counterpart is `1.58.1.4s:0x1401AC780`.
+
 ## Secondary findings kept for later
 
-Two real branches are intentionally not being opened in parallel:
+Two other real branches are intentionally not being opened in parallel:
 
 - `PRE_RENDER_OTHER` contributes roughly +1.5 ms in the accepted broad split;
-- the DX12 descriptor/root-binding branch contains real fixed-capacity sampler pressure, and sampler-table reuse removes roughly 95% of targeted allocation/copy work, but does **not** eliminate the broader heavy-state slowdown.
+- `RQ_PREP` is a measured but secondary child of the nested winner.
+
+The DX12 descriptor/root-binding branch is no longer merely parked as a secondary static lead: the accepted runtime leaf now reaches it directly. Prior sampler-table reuse still shows that sampler pressure alone is not the complete explanation.
 
 See [`docs/shader-profile-architecture-delta.md`](docs/shader-profile-architecture-delta.md).
 
