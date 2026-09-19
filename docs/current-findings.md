@@ -218,9 +218,26 @@ parent qpc / item           ~9.62 -> ~10.19  (~+6%)
 
 **FACT:** most of the previously observed apparent per-call slowdown is explained by larger item batches, not by the same constant work becoming 3–4x slower.
 
-**CURRENT QUESTION:** which stable queue-data index or queue class owns the item-count growth? Raw queue-data pointers churn almost every sampled call, so pointer identity is not useful. The active measurement derives a stable index from the render-queue-set owner and attaches descriptor metadata before recursing any deeper into constant-cost children.
+A stable-index follow-up closed the raw-pointer attribution problem. Across 238 ordinary windows, 113,391 queue identities validated with **0 invalid derivations and 0 bucket overflow**. One stable class, `queue_index 0 / tag 11`, carried about **80.7% of processed items** and **80.0% of measured queue time** overall. Across those windows, total item workload and queue-0 workload correlate at about `0.973`.
 
-The runtime path also reconnects to the descriptor/resource architecture because `BUNDLE_BUILD = 0x1402D7D70` is the generalized resource-bundle builder already mapped there. The prior sampler-reuse result still shows that sampler allocation/copy pressure is only part of the story.
+This class is dominant rather than exclusive: some matched-cardinality scene compositions move growth into other stable queues. More importantly, a larger item count is not by itself evidence of duplicate or invalid geometry. Heavy scenery can legitimately produce more render items, so a queue cap is not justified.
+
+The accepted downstream path now reconnects directly to the mapped DX12 descriptor architecture through the indirect call at `1.60.1.7s:0x1402D8F6C [vtable+0x260]`. Static mapping identifies the native-DX12 implementation as:
+
+```text
+1.60.1.7s:0x1402942D0
+dx12_device_t::shader_pipeline_build_descriptor_update_info(...)
+```
+
+Its known 1.58 counterpart is `0x1401AC780`. Inside the 1.60 implementation, the two fixed descriptor-heap reservations are reached at:
+
+```text
+RESOURCE  0x1402943FF -> 0x14028F070
+SAMPLER   0x140294438 -> 0x14028F070
+```
+
+**CURRENT QUESTION:** how much of the accepted heavy-state cost is descriptor-builder work, and within it how much belongs to resource reservation, sampler reservation, or the remaining descriptor update/write path? The next narrow measurement keeps the accepted stable-queue attribution and measures that split without changing rendering behavior.
+
 No behavior patch is justified yet.
 
 ## Secondary validated branch: descriptor/root-binding architecture
