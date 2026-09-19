@@ -28,9 +28,30 @@ RG_CORE
             -> 0x1402D8D20
 ```
 
-Current question: separate the no-split and ranged callsites from `HEAD_DISPATCH` to the shared downstream target.
+The no-split path is now accepted, and stable queue attribution shows one queue class carrying most sampled item work overall. The current narrow question is the native-DX12 descriptor-builder split reached from the accepted downstream path: descriptor-parent cost by stable queue, then resource reservation vs sampler reservation vs remaining descriptor-update work.
 
 See [`rg-core-runtime-localization.md`](rg-core-runtime-localization.md).
+
+## Stable queue attribution
+
+A stable-index queue-work follow-up validated 113,391 queue identities across ordinary windows with 0 invalid derivations and 0 bucket overflow.
+
+The dominant class, `queue_index 0 / tag 11`, carried about 80.7% of processed items and 80.0% of measured queue time overall, with `corr(total_items, queue0_items) ~= 0.973`.
+
+This result is an attribution result, not proof of overdraw or duplicated geometry. Some matched-cardinality scenes move growth into other queues, and heavy scenery can legitimately produce more render items.
+
+## Descriptor-builder discriminator
+
+The accepted downstream path reaches the native-DX12 descriptor builder through `0x1402D8F6C [vtable+0x260]`. Static mapping identifies the implementation as `0x1402942D0`, with 1.58 counterpart `0x1401AC780`.
+
+Inside 1.60 the resource and sampler reservation calls are:
+
+```text
+RESOURCE  0x1402943FF -> 0x14028F070
+SAMPLER   0x140294438 -> 0x14028F070
+```
+
+The next narrow runtime experiment measures this parent and allocator split while retaining stable queue attribution. It does not change rendering behavior.
 
 ## Confirmed useful optimization: sampler-table reuse
 
