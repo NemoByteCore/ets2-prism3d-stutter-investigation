@@ -157,9 +157,7 @@ This is negative evidence against the proposed practical six-shader-tuple/profil
 
 ## Current place in the investigation
 
-This branch remains a confirmed architectural change and a validated optimization target, but runtime localization has since moved much deeper into the rendergraph execution path.
-
-The current measured chain is summarized in [`current-findings.md`](current-findings.md). The active render-side leaf is currently downstream of:
+This branch remains a confirmed architectural change and a validated optimization target. Runtime localization moved much deeper through the rendergraph and then independently reconnected the accepted downstream leaf back to the native-DX12 descriptor builder:
 
 ```text
 RG_CORE
@@ -168,8 +166,13 @@ RG_CORE
       -> nested winner
         -> RQ_ONE
           -> HEAD_DISPATCH
+            -> downstream 0x1402D8D20
+              -> [vtable+0x260] at 0x1402D8F6C
+                -> 0x1402942D0 descriptor builder
 ```
 
-The descriptor/root-binding work should therefore be treated as a **secondary measured optimization branch**, not as the project's current root-cause candidate.
+Stable queue attribution also shows that the heavy-state multiplier is largely more legal per-item work, not merely fixed work becoming slower. The current question is therefore narrower: how much of that multiplied per-item workload is spent in fixed-profile resource reservation, sampler reservation, or the remaining descriptor-update path?
+
+Sampler pressure is still a validated component rather than a complete explanation; the branch is now an active runtime discriminator rather than a parked static theory.
 
 The public rule remains: static architecture differences and runtime structural ratios are evidence, but causal ranking comes from measured frame-budget ownership.
