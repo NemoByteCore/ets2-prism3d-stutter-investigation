@@ -2,6 +2,11 @@
 
 Evidence-driven reverse engineering of a scene-dependent CPU-side slowdown in **Euro Truck Simulator 2 1.60.1.7s** using the native DX12 renderer.
 
+> [!IMPORTANT]
+> **Project status: temporarily paused.**
+>
+> Active investigation work is currently suspended. The project is **not abandoned**: the existing findings, measurements, mappings and documentation remain valid project history and will stay available here. Work may resume later from the current checkpoint.
+
 ## Current status
 
 The render-side slowdown has been narrowed from the whole frame to one small dispatch path:
