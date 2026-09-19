@@ -24,7 +24,10 @@ Working names are research labels unless explicitly stated otherwise.
 | `0x14154C370` | RQ_PREP | Secondary measured winner child |
 | `0x14154C9F0` | RQ_ONE | Dominant measured winner child |
 | `0x14154CF60` | HEAD_DISPATCH | ~99.84% of sampled RQ_ONE time in accepted run |
-| `0x1402D8D20` | downstream dispatch implementation | Current recursion target |
+| `0x1402D8D20` | downstream dispatch implementation | Accepted item-batch owner |
+| `0x1402D8F6C` | indirect descriptor-build callsite | Runtime bridge into native DX12 descriptor builder |
+| `0x1402942D0` | `dx12_device_t::shader_pipeline_build_descriptor_update_info(...)` | Current narrow measurement target |
+| `0x14028F070` | descriptor heap allocation / cursor advance | Called for resource and sampler reservations inside descriptor builder |
 
 Current path:
 
@@ -36,6 +39,8 @@ RG_CORE
         -> RQ_ONE
           -> HEAD_DISPATCH
             -> 0x1402D8D20
+              -> [vtable+0x260] at 0x1402D8F6C
+                -> native DX12 0x1402942D0
 ```
 
 ## Current static counterparts
@@ -75,14 +80,14 @@ Demotion changes runtime priority; it does not invalidate the static mapping.
 
 ## Descriptor / root-binding branch
 
-This is a validated secondary optimization branch rather than the current root-cause path.
+This branch is now reconnected directly to the accepted runtime leaf. The fixed-profile architecture remains a validated optimization/regression component; the current narrow question is how much of the accepted downstream cost it owns.
 
 | 1.60.1.7s address | Working name |
 |---|---|
 | `0x14144C770` | uniform/resource context setup + provider-cache check |
 | `0x1402D7D70` | `r_device_t::resource_build_bundle(...)` |
 | `0x1402E25A0` | semantic/resource resolver |
-| `0x1402942D0` | descriptor update/build stage |
+| `0x1402942D0` | native DX12 descriptor update/build stage |
 | `0x14029E1F0` | generalized state/root-table submission |
 | `0x14028F070` | descriptor heap allocation / cursor advance |
 | `0x14028EBE0` | shader-visible descriptor heap setup |
